@@ -1,9 +1,97 @@
 """
-Data fetching via yfinance with Streamlit caching (15-min TTL)
+Data fetching via yfinance with Streamlit caching (15-min TTL).
+Sector multiples are fetched live from SPDR sector ETFs where possible;
+fallback values are industry-consensus estimates (labeled in the UI).
 """
 import yfinance as yf
 import pandas as pd
 import streamlit as st
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTOR MULTIPLES — live via ETF, fallback to industry estimates
+# ─────────────────────────────────────────────────────────────────────────────
+
+# SPDR sector ETF tickers used to fetch live P/E and P/B
+SECTOR_ETFS = {
+    "Technology":             "XLK",
+    "Communication Services": "XLC",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples":       "XLP",
+    "Healthcare":             "XLV",
+    "Financials":             "XLF",
+    "Industrials":            "XLI",
+    "Energy":                 "XLE",
+    "Materials":              "XLB",
+    "Real Estate":            "XLRE",
+    "Utilities":              "XLU",
+}
+
+# Fallback multiples: industry-consensus long-run medians.
+# Sources: Damodaran (NYU Stern) annual sector tables, Bloomberg sector aggregates.
+# These are HARDCODED estimates — used only when live ETF fetch fails.
+SECTOR_MULTIPLES_FALLBACK = {
+    "Technology":             {"pe": 28, "ev_ebitda": 20, "pb": 6.0},
+    "Communication Services": {"pe": 22, "ev_ebitda": 14, "pb": 3.0},
+    "Consumer Discretionary": {"pe": 22, "ev_ebitda": 15, "pb": 4.0},
+    "Consumer Staples":       {"pe": 20, "ev_ebitda": 13, "pb": 5.0},
+    "Healthcare":             {"pe": 22, "ev_ebitda": 14, "pb": 4.0},
+    "Financials":             {"pe": 13, "ev_ebitda": 11, "pb": 1.5},
+    "Industrials":            {"pe": 20, "ev_ebitda": 14, "pb": 3.0},
+    "Energy":                 {"pe": 12, "ev_ebitda":  7, "pb": 1.5},
+    "Materials":              {"pe": 17, "ev_ebitda": 10, "pb": 2.0},
+    "Real Estate":            {"pe": 35, "ev_ebitda": 18, "pb": 2.0},
+    "Utilities":              {"pe": 17, "ev_ebitda": 10, "pb": 1.5},
+    "default":                {"pe": 20, "ev_ebitda": 13, "pb": 3.0},
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sector_multiples(sector: str) -> dict:
+    """
+    Fetch live sector P/E and P/B from the sector's SPDR ETF via yfinance.
+    EV/EBITDA is always a hardcoded fallback (not available in ETF info).
+
+    Returns dict with keys:
+      pe, pb, ev_ebitda              — numeric multiples to use
+      pe_source, pb_source,
+      ev_ebitda_source               — human-readable source string for UI labeling
+    """
+    fb  = SECTOR_MULTIPLES_FALLBACK.get(sector) or SECTOR_MULTIPLES_FALLBACK["default"]
+    etf = SECTOR_ETFS.get(sector)
+
+    result = {
+        "pe":             fb["pe"],
+        "pb":             fb["pb"],
+        "ev_ebitda":      fb["ev_ebitda"],
+        "pe_source":      "⚠️ est. (industry fallback)",
+        "pb_source":      "⚠️ est. (industry fallback)",
+        "ev_ebitda_source": "⚠️ est. (industry fallback)",
+    }
+
+    if not etf:
+        # No matching ETF (e.g. Indian stocks) — keep fallback
+        return result
+
+    try:
+        info     = yf.Ticker(etf).info or {}
+        live_pe  = info.get("trailingPE") or info.get("forwardPE")
+        live_pb  = info.get("priceToBook")
+
+        if live_pe and isinstance(live_pe, (int, float)) and 5 < live_pe < 120:
+            result["pe"]        = round(float(live_pe), 1)
+            result["pe_source"] = f"✅ live ({etf} ETF)"
+
+        if live_pb and isinstance(live_pb, (int, float)) and 0.1 < live_pb < 60:
+            result["pb"]        = round(float(live_pb), 2)
+            result["pb_source"] = f"✅ live ({etf} ETF)"
+
+    except Exception:
+        pass  # keep fallback values
+
+    # EV/EBITDA: not directly available from ETF ticker info
+    # Always labeled as an industry estimate
+    return result
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -212,10 +300,12 @@ def extract_fundamentals(ticker: str) -> dict:
     result["net_debt"] = total_debt - cash
 
     # Analyst data
-    result["analyst_target"] = info.get("targetMeanPrice")
-    result["analyst_low"] = info.get("targetLowPrice")
-    result["analyst_high"] = info.get("targetHighPrice")
-    result["recommendation"] = info.get("recommendationKey", "").upper()
+    result["analyst_target"]      = info.get("targetMeanPrice")
+    result["analyst_low"]         = info.get("targetLowPrice")
+    result["analyst_high"]        = info.get("targetHighPrice")
+    result["recommendation"]      = info.get("recommendationKey", "").upper()
+    result["recommendation_mean"] = info.get("recommendationMean")   # 1=Strong Buy → 5=Strong Sell
+    result["analyst_count"]       = info.get("numberOfAnalystOpinions")
 
     # Dividend
     result["dividend_rate"] = info.get("dividendRate")

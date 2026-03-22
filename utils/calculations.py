@@ -10,7 +10,7 @@ import pandas as pd
 # ─────────────────────────────────────────────
 
 def graham_number(eps, book_value_per_share):
-    """√(22.5 × EPS × BVPS)"""
+    """√(22.5 × EPS × BVPS) — Benjamin Graham's intrinsic value formula."""
     try:
         if eps is None or book_value_per_share is None:
             return None
@@ -52,52 +52,38 @@ def dcf_valuation(free_cash_flow, growth_rate, shares_outstanding,
         return None
 
 
-def pe_based_valuation(eps, sector="default"):
+def pe_based_valuation(eps, forward_eps, sector_pe):
     """
     EPS × sector benchmark P/E.
 
-    Uses sector-average P/E as the benchmark — NOT the stock's own trailing P/E,
-    which is circular (EPS × Price/EPS = Price always).
-    These multiples reflect long-run median P/E paid by the market per sector.
+    Uses trailing EPS first; falls back to forward EPS for growth / loss-making companies.
+    sector_pe should come from live sector ETF data (see data.fetch_sector_multiples)
+    or industry-consensus fallback (labeled accordingly in the UI).
+
+    Returns: (value_or_None, eps_label_or_None)
     """
-    SECTOR_PE = {
-        "Technology": 28,
-        "Communication Services": 22,
-        "Consumer Discretionary": 22,
-        "Consumer Staples": 20,
-        "Healthcare": 22,
-        "Financials": 13,
-        "Industrials": 20,
-        "Energy": 12,
-        "Materials": 15,
-        "Real Estate": 35,
-        "Utilities": 17,
-        "default": 20,
-    }
     try:
-        if eps is None or eps <= 0:
-            return None
-        benchmark_pe = SECTOR_PE.get(sector, SECTOR_PE["default"])
-        return round(eps * benchmark_pe, 2)
+        # Prefer trailing EPS (actual earnings)
+        if eps is not None and eps > 0:
+            return round(eps * sector_pe, 2), "trailing EPS"
+        # Fall back to forward EPS (analyst estimates) for growth / pre-profit companies
+        if forward_eps is not None and forward_eps > 0:
+            return round(forward_eps * sector_pe, 2), "fwd EPS"
+        # Negative / unavailable EPS — PE-based valuation doesn't apply
+        return None, None
     except Exception:
-        return None
+        return None, None
 
 
-def ev_ebitda_valuation(ebitda, net_debt, shares_outstanding, sector="default"):
-    """EV/EBITDA based valuation using sector median multiples"""
-    SECTOR_MULTIPLES = {
-        "Technology": 20, "Communication Services": 18,
-        "Consumer Discretionary": 15, "Consumer Staples": 14,
-        "Healthcare": 15, "Financials": 12,
-        "Industrials": 14, "Energy": 8,
-        "Materials": 10, "Real Estate": 16,
-        "Utilities": 10, "default": 15,
-    }
+def ev_ebitda_valuation(ebitda, net_debt, shares_outstanding, ev_multiple):
+    """
+    EV/EBITDA-based valuation.
+    ev_multiple: sector median EV/EBITDA (live or fallback from data.fetch_sector_multiples).
+    """
     try:
         if ebitda is None or ebitda <= 0 or shares_outstanding is None or shares_outstanding <= 0:
             return None
-        multiple = SECTOR_MULTIPLES.get(sector, SECTOR_MULTIPLES["default"])
-        enterprise_value = ebitda * multiple
+        enterprise_value = ebitda * ev_multiple
         net_debt = net_debt or 0
         equity_value = enterprise_value - net_debt
         return round(max(equity_value / shares_outstanding, 0), 2)
@@ -105,27 +91,21 @@ def ev_ebitda_valuation(ebitda, net_debt, shares_outstanding, sector="default"):
         return None
 
 
-def pb_valuation(book_value_per_share, sector="default"):
-    """Price/Book vs sector average"""
-    SECTOR_PB = {
-        "Technology": 6, "Communication Services": 3,
-        "Consumer Discretionary": 4, "Consumer Staples": 5,
-        "Healthcare": 4, "Financials": 1.5,
-        "Industrials": 3, "Energy": 1.5,
-        "Materials": 2, "Real Estate": 2,
-        "Utilities": 1.5, "default": 3,
-    }
+def pb_valuation(book_value_per_share, pb_multiple):
+    """
+    Book Value × sector P/B multiple.
+    pb_multiple: sector median P/B (live or fallback from data.fetch_sector_multiples).
+    """
     try:
         if book_value_per_share is None or book_value_per_share <= 0:
             return None
-        pb = SECTOR_PB.get(sector, SECTOR_PB["default"])
-        return round(book_value_per_share * pb, 2)
+        return round(book_value_per_share * pb_multiple, 2)
     except Exception:
         return None
 
 
 def peg_signal(pe_ratio, earnings_growth_rate):
-    """PEG = P/E ÷ Earnings Growth Rate. <1 undervalued, >1 overvalued"""
+    """PEG = P/E ÷ Earnings Growth Rate (%). <1 undervalued, >1.5 overvalued."""
     try:
         if pe_ratio is None or earnings_growth_rate is None:
             return None, None
@@ -138,9 +118,8 @@ def peg_signal(pe_ratio, earnings_growth_rate):
         return None, None
 
 
-def dividend_discount_model(dividend_per_share, dividend_growth_rate,
-                             discount_rate=0.10):
-    """Gordon Growth Model: D / (r - g)"""
+def dividend_discount_model(dividend_per_share, dividend_growth_rate, discount_rate=0.10):
+    """Gordon Growth Model: Intrinsic Value = D / (r - g)"""
     try:
         if dividend_per_share is None or dividend_per_share <= 0:
             return None
@@ -153,16 +132,30 @@ def dividend_discount_model(dividend_per_share, dividend_growth_rate,
         return None
 
 
-def composite_fair_value(values: list):
-    """Weighted average of all valid (non-None) fair value estimates"""
-    valid = [v for v in values if v is not None and v > 0]
-    if not valid:
+def composite_fair_value(values: dict, weights: dict):
+    """
+    Weighted average of valid (non-None, positive) fair value estimates.
+
+    values:  {method_key: value_or_None}   e.g. {"graham": 120.5, "dcf": None, ...}
+    weights: {method_key: weight_0_to_100}  e.g. {"graham": 15, "dcf": 30, ...}
+
+    Missing methods are silently skipped; remaining weights are auto-normalised.
+    Returns None if no valid method is available.
+    """
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for key, val in values.items():
+        w = weights.get(key, 0)
+        if val is not None and val > 0 and w > 0:
+            weighted_sum += val * w
+            total_weight += w
+    if total_weight == 0:
         return None
-    return round(sum(valid) / len(valid), 2)
+    return round(weighted_sum / total_weight, 2)
 
 
 def fundamental_signal(current_price, fair_value):
-    """Return signal + upside%"""
+    """Return (signal_text, upside_pct)."""
     try:
         if current_price is None or fair_value is None or fair_value == 0:
             return "N/A", 0
@@ -178,7 +171,7 @@ def fundamental_signal(current_price, fair_value):
 
 
 def fundamental_score(current_price, fair_value, metrics: dict):
-    """0-100 score based on valuation + quality metrics"""
+    """0-100 score based on valuation + quality metrics."""
     score = 50  # Base
 
     # Valuation component (up to ±25)
@@ -186,18 +179,17 @@ def fundamental_score(current_price, fair_value, metrics: dict):
         upside = (fair_value - current_price) / current_price
         score += min(25, max(-25, upside * 50))
 
-    # Quality metrics
     roe = metrics.get("roe")
     if roe:
-        if roe > 0.20: score += 5
+        if roe > 0.20:   score += 5
         elif roe > 0.12: score += 2
-        elif roe < 0: score -= 5
+        elif roe < 0:    score -= 5
 
     net_margin = metrics.get("net_margin")
     if net_margin:
-        if net_margin > 0.15: score += 5
+        if net_margin > 0.15:   score += 5
         elif net_margin > 0.08: score += 2
-        elif net_margin < 0: score -= 5
+        elif net_margin < 0:    score -= 5
 
     de_ratio = metrics.get("debt_equity")
     if de_ratio is not None:
@@ -211,8 +203,8 @@ def fundamental_score(current_price, fair_value, metrics: dict):
 
     rev_growth = metrics.get("revenue_growth")
     if rev_growth:
-        if rev_growth > 0.10: score += 5
-        elif rev_growth > 0: score += 2
+        if rev_growth > 0.10:   score += 5
+        elif rev_growth > 0:    score += 2
         elif rev_growth < -0.05: score -= 3
 
     short_pct = metrics.get("short_pct")
@@ -249,7 +241,7 @@ def rsi(series: pd.Series, period=14) -> pd.Series:
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    # When avg_loss == 0 (all gains), RSI = 100; avoids division by zero → NaN
+    # When avg_loss == 0 (all gains), RSI = 100 — avoids divide-by-zero → NaN
     rsi_val = np.where(
         avg_loss == 0,
         100.0,
@@ -269,36 +261,33 @@ def macd(series: pd.Series, fast=12, slow=26, signal_period=9):
 
 def atr(df: pd.DataFrame, period=14) -> pd.Series:
     high = df["High"]
-    low = df["Low"]
+    low  = df["Low"]
     close = df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
-        (low - prev_close).abs()
+        (low  - prev_close).abs()
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
 def find_support_resistance(df: pd.DataFrame, window=5, n_levels=3):
-    """Find swing highs (resistance) and swing lows (support)"""
+    """Find swing highs (resistance) and swing lows (support)."""
     highs = df["High"].values
-    lows = df["Low"].values
+    lows  = df["Low"].values
 
     resistance = []
-    support = []
+    support    = []
 
     for i in range(window, len(highs) - window):
-        # Local maximum
         if all(highs[i] >= highs[i - j] for j in range(1, window + 1)) and \
            all(highs[i] >= highs[i + j] for j in range(1, window + 1)):
             resistance.append(highs[i])
-        # Local minimum
         if all(lows[i] <= lows[i - j] for j in range(1, window + 1)) and \
            all(lows[i] <= lows[i + j] for j in range(1, window + 1)):
             support.append(lows[i])
 
-    # Cluster similar levels (within 1%) and return up to n_levels
     def cluster_levels(levels, ascending=False):
         if not levels:
             return []
@@ -314,21 +303,20 @@ def find_support_resistance(df: pd.DataFrame, window=5, n_levels=3):
             clusters.append(round(float(np.mean(group)), 2))
             used.update(group)
         result = clusters[:n_levels]
-        # Resistance: sort ascending so [0] = nearest (lowest) resistance above price
-        # Support:    sort descending so [0] = nearest (highest) support below price
         result.sort(reverse=not ascending)
         return result
 
-    # resistance sorted ascending (nearest first), support sorted descending (nearest first)
+    # Resistance: ascending (nearest = lowest above price first)
+    # Support:    descending (nearest = highest below price first)
     return cluster_levels(resistance, ascending=True), cluster_levels(support, ascending=False)
 
 
 def technical_score(df: pd.DataFrame):
-    """0-100 technical score from multiple signals"""
+    """0-100 technical score from multiple signals."""
     if df is None or len(df) < 50:
         return 50, {}
 
-    close = df["Close"]
+    close   = df["Close"]
     current = close.iloc[-1]
 
     sma50_val  = sma(close, 50).iloc[-1]
@@ -339,7 +327,6 @@ def technical_score(df: pd.DataFrame):
     macd_val   = macd_line.iloc[-1]
     signal_val = signal_line.iloc[-1]
 
-    # Guard against NaN values (can occur with sparse data)
     def _safe(v, fallback=0.0):
         return fallback if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
 
@@ -349,60 +336,42 @@ def technical_score(df: pd.DataFrame):
     rsi_val    = _safe(rsi_val,    50.0)
     macd_val   = _safe(macd_val,   0.0)
     signal_val = _safe(signal_val, 0.0)
-    # Rename back to original names used below
     sma50, sma200, ema9 = sma50_val, sma200_val, ema9_val
 
     resistance, support = find_support_resistance(df)
 
-    score = 50
+    score   = 50
     signals = {}
 
-    # Price vs SMA200
     if current > sma200:
-        score += 12
-        signals["Price > SMA200"] = "✅ Bullish"
+        score += 12;  signals["Price > SMA200"] = "✅ Bullish"
     else:
-        score -= 8
-        signals["Price > SMA200"] = "❌ Bearish"
+        score -= 8;   signals["Price > SMA200"] = "❌ Bearish"
 
-    # Price vs SMA50
     if current > sma50:
-        score += 8
-        signals["Price > SMA50"] = "✅ Bullish"
+        score += 8;   signals["Price > SMA50"] = "✅ Bullish"
     else:
-        score -= 5
-        signals["Price > SMA50"] = "❌ Bearish"
+        score -= 5;   signals["Price > SMA50"] = "❌ Bearish"
 
-    # EMA9 vs SMA50
     if ema9 > sma50:
-        score += 5
-        signals["EMA9 > SMA50"] = "✅ Bullish"
+        score += 5;   signals["EMA9 > SMA50"] = "✅ Bullish"
     else:
-        score -= 3
-        signals["EMA9 > SMA50"] = "❌ Bearish"
+        score -= 3;   signals["EMA9 > SMA50"] = "❌ Bearish"
 
-    # RSI
     if rsi_val < 30:
-        score += 10
-        signals[f"RSI ({rsi_val:.0f})"] = "✅ Oversold – Bullish"
+        score += 10;  signals[f"RSI ({rsi_val:.0f})"] = "✅ Oversold – Bullish"
     elif rsi_val > 70:
-        score -= 10
-        signals[f"RSI ({rsi_val:.0f})"] = "❌ Overbought – Bearish"
+        score -= 10;  signals[f"RSI ({rsi_val:.0f})"] = "❌ Overbought – Bearish"
     elif 40 <= rsi_val <= 65:
-        score += 5
-        signals[f"RSI ({rsi_val:.0f})"] = "✅ Neutral-Bullish"
+        score += 5;   signals[f"RSI ({rsi_val:.0f})"] = "✅ Neutral-Bullish"
     else:
         signals[f"RSI ({rsi_val:.0f})"] = "⚪ Neutral"
 
-    # MACD
     if macd_val > signal_val:
-        score += 8
-        signals["MACD"] = "✅ Bullish Crossover"
+        score += 8;   signals["MACD"] = "✅ Bullish Crossover"
     else:
-        score -= 5
-        signals["MACD"] = "❌ Bearish Crossover"
+        score -= 5;   signals["MACD"] = "❌ Bearish Crossover"
 
-    # Near support/resistance
     if support:
         nearest_support = min(support, key=lambda x: abs(x - current))
         if abs(current - nearest_support) / current < 0.03:
@@ -423,30 +392,25 @@ def technical_score(df: pd.DataFrame):
 # ─────────────────────────────────────────────
 
 def investment_decision(fund_score: int, tech_score: int):
-    """Combine fundamental (60%) + technical (40%) into BUY/SELL/HOLD"""
+    """Combine fundamental (60%) + technical (40%) into BUY/SELL/HOLD."""
     combined = fund_score * 0.6 + tech_score * 0.4
     if combined >= 70:
-        signal = "🟢 BUY"
-        action = "BUY"
+        signal, action = "🟢 BUY",       "BUY"
     elif combined >= 57:
-        signal = "🟩 ACCUMULATE"
-        action = "ACCUMULATE"
+        signal, action = "🟩 ACCUMULATE", "ACCUMULATE"
     elif combined >= 43:
-        signal = "🟡 HOLD"
-        action = "HOLD"
+        signal, action = "🟡 HOLD",       "HOLD"
     elif combined >= 30:
-        signal = "🟠 REDUCE"
-        action = "REDUCE"
+        signal, action = "🟠 REDUCE",     "REDUCE"
     else:
-        signal = "🔴 SELL"
-        action = "SELL"
+        signal, action = "🔴 SELL",       "SELL"
     return signal, action, round(combined)
 
 
 def tranche_plan(action, current_price, support_levels, resistance_levels):
-    """Generate tranche deployment / exit plan"""
-    s1 = support_levels[0] if len(support_levels) > 0 else current_price * 0.92
-    s2 = support_levels[1] if len(support_levels) > 1 else current_price * 0.85
+    """Generate tranche deployment / exit plan."""
+    s1 = support_levels[0]    if len(support_levels) > 0 else current_price * 0.92
+    s2 = support_levels[1]    if len(support_levels) > 1 else current_price * 0.85
     r1 = resistance_levels[0] if len(resistance_levels) > 0 else current_price * 1.08
     r2 = resistance_levels[1] if len(resistance_levels) > 1 else current_price * 1.15
 
@@ -465,7 +429,7 @@ def tranche_plan(action, current_price, support_levels, resistance_levels):
         plan = [
             {"Tranche": "No new buy", "% Capital": "—", "Price Level": "—",
              "Condition": "Monitor", "Rationale": "Wait for breakout or pullback"},
-            {"Tranche": "Trim 20%", "% Capital": "20%", "Price Level": f"${r1:.2f}",
+            {"Tranche": "Trim 20%",   "% Capital": "20%", "Price Level": f"${r1:.2f}",
              "Condition": f"Price reaches ${r1:.2f}", "Rationale": "Book partial profits at R1"},
         ]
     else:  # REDUCE / SELL
