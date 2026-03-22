@@ -320,6 +320,25 @@ with st.spinner(f"Loading {selected_ticker}..."):
     fund_data = extract_fundamentals(selected_ticker)
     hist_df   = fetch_history(selected_ticker, period)
 
+# ── Rate-limit / empty-data guard ──────────────────────────────
+_price_ok = fund_data.get("current_price") is not None
+_data_ok  = bool(fund_data) and _price_ok
+
+if not _data_ok:
+    st.error(
+        "⚠️ **Yahoo Finance returned no data for this ticker.**\n\n"
+        "This is almost always a **rate-limit** from Yahoo Finance's servers — not a bug in the app. "
+        "Streamlit Community Cloud shares its outbound IP with many other apps, and Yahoo Finance "
+        "briefly blocks requests from that IP when too many arrive at once."
+    )
+    st.info(
+        "**What to do:**\n"
+        "1. Wait **30–60 seconds**, then click **🔍 Analyze** in the sidebar to retry.\n"
+        "2. If it still fails after 2–3 retries, wait 2–3 minutes and try again.\n"
+        "3. Try a different ticker first to 'warm up' the session, then return to this one."
+    )
+    st.stop()
+
 # Header
 current_price = fund_data.get("current_price")
 name          = fund_data.get("name", selected_name)

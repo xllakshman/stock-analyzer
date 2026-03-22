@@ -46,52 +46,26 @@ SECTOR_MULTIPLES_FALLBACK = {
 }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_sector_multiples(sector: str) -> dict:
     """
-    Fetch live sector P/E and P/B from the sector's SPDR ETF via yfinance.
-    EV/EBITDA is always a hardcoded fallback (not available in ETF info).
+    Returns sector benchmark multiples for PE, P/B, and EV/EBITDA.
 
-    Returns dict with keys:
-      pe, pb, ev_ebitda              — numeric multiples to use
-      pe_source, pb_source,
-      ev_ebitda_source               — human-readable source string for UI labeling
+    NOTE: Live ETF fetching was intentionally removed to avoid extra API calls
+    that push Streamlit Cloud's shared IP over Yahoo Finance's rate limit.
+    Values are industry-consensus long-run medians (Damodaran/Bloomberg).
+    All values are clearly labeled as estimates in the UI.
     """
-    fb  = SECTOR_MULTIPLES_FALLBACK.get(sector) or SECTOR_MULTIPLES_FALLBACK["default"]
-    etf = SECTOR_ETFS.get(sector)
-
-    result = {
-        "pe":             fb["pe"],
-        "pb":             fb["pb"],
-        "ev_ebitda":      fb["ev_ebitda"],
-        "pe_source":      "⚠️ est. (industry fallback)",
-        "pb_source":      "⚠️ est. (industry fallback)",
-        "ev_ebitda_source": "⚠️ est. (industry fallback)",
+    fb = SECTOR_MULTIPLES_FALLBACK.get(sector) or SECTOR_MULTIPLES_FALLBACK["default"]
+    etf_name = SECTOR_ETFS.get(sector, "")
+    ref = f"⚠️ est. (Damodaran/Bloomberg median{', ref: ' + etf_name if etf_name else ''})"
+    return {
+        "pe":               fb["pe"],
+        "pb":               fb["pb"],
+        "ev_ebitda":        fb["ev_ebitda"],
+        "pe_source":        ref,
+        "pb_source":        ref,
+        "ev_ebitda_source": ref,
     }
-
-    if not etf:
-        # No matching ETF (e.g. Indian stocks) — keep fallback
-        return result
-
-    try:
-        info     = yf.Ticker(etf).info or {}
-        live_pe  = info.get("trailingPE") or info.get("forwardPE")
-        live_pb  = info.get("priceToBook")
-
-        if live_pe and isinstance(live_pe, (int, float)) and 5 < live_pe < 120:
-            result["pe"]        = round(float(live_pe), 1)
-            result["pe_source"] = f"✅ live ({etf} ETF)"
-
-        if live_pb and isinstance(live_pb, (int, float)) and 0.1 < live_pb < 60:
-            result["pb"]        = round(float(live_pb), 2)
-            result["pb_source"] = f"✅ live ({etf} ETF)"
-
-    except Exception:
-        pass  # keep fallback values
-
-    # EV/EBITDA: not directly available from ETF ticker info
-    # Always labeled as an industry estimate
-    return result
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -127,23 +101,62 @@ def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_financials(ticker: str) -> dict:
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info
+    """
+    Fetch fundamental data with retry logic and rate-limit detection.
 
-        # Income statement
-        income = t.income_stmt  # annual
-        cashflow = t.cashflow
-        balance = t.balance_sheet
+    Yahoo Finance rate-limits aggressively on shared IPs (Streamlit Cloud).
+    Symptoms: .info returns a minimal dict with < 20 keys instead of 100+.
+    Fix: detect minimal responses and retry with exponential back-off.
+    """
+    import time
 
-        return {
-            "info": info,
-            "income": income,
-            "cashflow": cashflow,
-            "balance": balance,
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    # --- Minimum number of keys a valid .info response must have ---
+    # Rate-limited / empty responses return ~3-5 keys; valid ones return 100+
+    MIN_INFO_KEYS = 20
+
+    last_error = "unknown"
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(4 * attempt)   # 4s, 8s back-off
+
+            t    = yf.Ticker(ticker)
+            info = t.info or {}
+
+            if len(info) < MIN_INFO_KEYS:
+                last_error = f"rate_limited (got {len(info)} keys)"
+                continue   # retry
+
+            # Small delay between financial-statement requests to avoid burst
+            time.sleep(0.4)
+            try:
+                income = t.income_stmt
+            except Exception:
+                income = pd.DataFrame()
+
+            time.sleep(0.3)
+            try:
+                cashflow = t.cashflow
+            except Exception:
+                cashflow = pd.DataFrame()
+
+            time.sleep(0.3)
+            try:
+                balance = t.balance_sheet
+            except Exception:
+                balance = pd.DataFrame()
+
+            return {
+                "info":     info,
+                "income":   income,
+                "cashflow": cashflow,
+                "balance":  balance,
+            }
+
+        except Exception as e:
+            last_error = str(e)
+
+    return {"error": last_error, "rate_limited": True}
 
 
 def safe_get(d: dict, *keys, default=None):
