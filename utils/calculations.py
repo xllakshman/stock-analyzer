@@ -52,14 +52,33 @@ def dcf_valuation(free_cash_flow, growth_rate, shares_outstanding,
         return None
 
 
-def pe_based_valuation(eps, trailing_pe, forward_pe=None):
-    """EPS × historical/sector average P/E"""
+def pe_based_valuation(eps, sector="default"):
+    """
+    EPS × sector benchmark P/E.
+
+    Uses sector-average P/E as the benchmark — NOT the stock's own trailing P/E,
+    which is circular (EPS × Price/EPS = Price always).
+    These multiples reflect long-run median P/E paid by the market per sector.
+    """
+    SECTOR_PE = {
+        "Technology": 28,
+        "Communication Services": 22,
+        "Consumer Discretionary": 22,
+        "Consumer Staples": 20,
+        "Healthcare": 22,
+        "Financials": 13,
+        "Industrials": 20,
+        "Energy": 12,
+        "Materials": 15,
+        "Real Estate": 35,
+        "Utilities": 17,
+        "default": 20,
+    }
     try:
         if eps is None or eps <= 0:
             return None
-        # Use trailing P/E but cap at 35 to avoid extreme values
-        pe = trailing_pe if trailing_pe and 5 < trailing_pe < 50 else 20
-        return round(eps * pe, 2)
+        benchmark_pe = SECTOR_PE.get(sector, SECTOR_PE["default"])
+        return round(eps * benchmark_pe, 2)
     except Exception:
         return None
 

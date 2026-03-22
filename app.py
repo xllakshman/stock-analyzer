@@ -272,7 +272,7 @@ with tab1:
     # ── COMPUTE FAIR VALUES ──
     graham = graham_number(eps, bvps)
     dcf    = dcf_valuation(fcf, dcf_growth, shares)
-    pe_val = pe_based_valuation(eps, pe)
+    pe_val = pe_based_valuation(eps, sector)  # sector benchmark P/E, not stock's own (avoids circular math)
     ev_val = ev_ebitda_valuation(ebitda, net_debt, shares, sector)
     pb_val = pb_valuation(bvps, sector)
     # DDM: use 4% default dividend growth rate.
@@ -329,7 +329,16 @@ with tab1:
     with c2:
         valuation_card(f"DCF (5-yr, {dcf_growth*100:.0f}% growth)", dcf, current_price)
     with c3:
-        valuation_card(f"PE-Based ({pe:.0f}x)" if pe else "PE-Based", pe_val, current_price)
+        # Show the sector benchmark P/E being used (not stock's own P/E)
+        SECTOR_PE_DISPLAY = {
+            "Technology": 28, "Communication Services": 22,
+            "Consumer Discretionary": 22, "Consumer Staples": 20,
+            "Healthcare": 22, "Financials": 13, "Industrials": 20,
+            "Energy": 12, "Materials": 15, "Real Estate": 35,
+            "Utilities": 17, "default": 20,
+        }
+        benchmark_pe = SECTOR_PE_DISPLAY.get(sector, 20)
+        valuation_card(f"PE-Based (sector avg {benchmark_pe}x)", pe_val, current_price)
 
     c4, c5, c6 = st.columns(3)
     with c4:
@@ -338,7 +347,7 @@ with tab1:
         valuation_card("Price-to-Book", pb_val, current_price)
     with c6:
         if div_rate and div_rate > 0:
-            valuation_card("Dividend Discount Model", ddm, current_price)
+            valuation_card("Dividend Discount Model (4% growth)", ddm, current_price)
         else:
             st.markdown("""
             <div class="metric-card" style="border-left:3px solid #334155">
@@ -347,14 +356,22 @@ with tab1:
               <div class="metric-sub">Not a dividend-paying stock</div>
             </div>""", unsafe_allow_html=True)
 
-    # PEG
+    # PEG — shown separately with an explanation note
     if peg_v is not None:
         peg_color = "#22c55e" if peg_v < 1 else ("#ef4444" if peg_v > 1.5 else "#eab308")
+        own_pe_str = f" (stock P/E: {pe:.1f}x)" if pe else ""
         st.markdown(f"""
         <div class="metric-card" style="border-left:3px solid {peg_color}">
-          <div class="metric-label">PEG Ratio</div>
-          <div class="metric-value" style="color:{peg_color}">{peg_v:.2f}</div>
-          <div class="metric-sub">{peg_sig} — PEG &lt; 1 is undervalued, &gt; 1.5 is overvalued</div>
+          <div class="metric-label">PEG Ratio{own_pe_str}</div>
+          <div class="metric-value" style="color:{peg_color}">{peg_v:.2f} — {peg_sig}</div>
+          <div class="metric-sub">
+            PEG = P/E ÷ Earnings Growth Rate. &lt;1 = growth justifies valuation, &gt;1.5 = expensive relative to growth.<br>
+            <span style="color:#64748b;font-size:0.72rem">
+              ⚠️ PEG and Composite Fair Value can disagree: PEG rewards fast-growing companies;
+              absolute methods (Graham, DCF) may still flag them as expensive on a pure value basis.
+              Both views are valid and complementary.
+            </span>
+          </div>
         </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
