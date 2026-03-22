@@ -74,12 +74,15 @@ def extract_fundamentals(ticker: str) -> dict:
     if not data or ("error" in data and not data.get("info")):
         return {}
 
-    info = data.get("info") or {}
-    # .get(key, default) won't use default when key exists but value is None,
-    # so use "or" to also guard against None returns from yfinance
-    income   = data.get("income")   or pd.DataFrame()
-    cashflow = data.get("cashflow") or pd.DataFrame()
-    balance  = data.get("balance")  or pd.DataFrame()
+    # Explicit None checks — cannot use `or` with DataFrames because
+    # bool(DataFrame) raises ValueError: "The truth value of a DataFrame is ambiguous"
+    def _safe_df(val):
+        return val if isinstance(val, pd.DataFrame) else pd.DataFrame()
+
+    info     = data.get("info") if isinstance(data.get("info"), dict) else {}
+    income   = _safe_df(data.get("income"))
+    cashflow = _safe_df(data.get("cashflow"))
+    balance  = _safe_df(data.get("balance"))
 
     result = {}
 
