@@ -118,10 +118,34 @@ st.markdown("""
     font-size: 0.88rem; color: #cbd5e1;
   }
 
-  /* Tab: active text only — no blue background box */
-  .stTabs [data-baseweb="tab-list"] { background: #1e293b; border-radius: 8px; padding: 4px; gap: 4px; }
-  .stTabs [data-baseweb="tab"] { color: #94a3b8; border-radius: 6px; font-weight: 500; background: transparent !important; }
-  .stTabs [aria-selected="true"] { background: transparent !important; color: #3b82f6 !important; font-weight: 700 !important; border-bottom: 2px solid #3b82f6 !important; }
+  /* Tab navigation — clean underline style */
+  .stTabs [data-baseweb="tab-list"] {
+    background: transparent;
+    border-bottom: 2px solid #1e293b;
+    border-radius: 0;
+    padding: 0;
+    gap: 0;
+    margin-bottom: 16px;
+  }
+  .stTabs [data-baseweb="tab"] {
+    color: #64748b;
+    font-weight: 500;
+    font-size: 0.92rem;
+    background: transparent !important;
+    border-radius: 0;
+    padding: 10px 22px;
+    border-bottom: 3px solid transparent;
+    margin-bottom: -2px;
+    transition: color 0.15s;
+    letter-spacing: 0.01em;
+  }
+  .stTabs [data-baseweb="tab"]:hover { color: #cbd5e1 !important; }
+  .stTabs [aria-selected="true"] {
+    background: transparent !important;
+    color: #f1f5f9 !important;
+    font-weight: 700 !important;
+    border-bottom: 3px solid #3b82f6 !important;
+  }
 
   .stDataFrame { background: #1e293b !important; }
   .stTextInput input, .stSelectbox select { background: #1e293b !important; color: #f1f5f9 !important; border-color: #334155 !important; }
@@ -309,7 +333,7 @@ with st.sidebar:
     # ── Risk Appetite ──────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### Risk Appetite")
-    risk_choice = st.radio("Profile", list(RISK_PRESETS.keys()), index=1, key="risk_profile")
+    risk_choice = st.radio("Profile", list(RISK_PRESETS.keys()), index=0, key="risk_profile")
     preset      = RISK_PRESETS[risk_choice]
     st.caption(preset["desc"])
 
@@ -474,8 +498,9 @@ with tab1:
     f_score = fundamental_score(current_price, composite, metrics_for_score)
 
     # ── SIGNAL BANNER ──
-    banner_color = "#14532d" if "Undervalued" in signal_text else ("#7f1d1d" if "Overvalued" in signal_text else "#713f12")
-    border_color = "#22c55e" if "Undervalued" in signal_text else ("#ef4444" if "Overvalued" in signal_text else "#eab308")
+    # Green = Undervalued or Fair Value (both positive signals), Red = Overvalued
+    banner_color = "#7f1d1d" if "Overvalued" in signal_text else "#14532d"
+    border_color = "#ef4444" if "Overvalued" in signal_text else "#22c55e"
     composite_str = f"${composite:,.2f}" if composite else "N/A"
     upside_str    = f"{upside_pct:+.2f}%" if upside_pct is not None else "N/A"
 
@@ -731,6 +756,48 @@ with tab2:
             for i, (k, v) in enumerate(items):
                 cols[i % 2].markdown(f"**{k}**: {v}")
 
+        with st.expander("What do these technical indicators mean?", expanded=False):
+            st.markdown("""
+**Price vs SMA200 (200-day Simple Moving Average)**
+The single most-watched line by institutional investors. If price is above SMA200 the stock is in a long-term uptrend; below = downtrend. Fund managers often have hard rules not to buy below SMA200. *Contributes ±12 pts to technical score.*
+
+**Price vs SMA50 (50-day Simple Moving Average)**
+Short-to-medium trend filter. Price above SMA50 = momentum is positive over the past 2–3 months. Crossing below SMA50 is an early warning sign. *Contributes ±8 pts.*
+
+**EMA9 vs SMA50 (Short-term momentum crossover)**
+EMA9 is the 9-day Exponential Moving Average — it reacts faster to recent price moves than SMA50. When EMA9 crosses above SMA50, it signals that short-term momentum has turned positive. *Contributes ±5 pts.*
+
+**RSI — Relative Strength Index (14-day)**
+Measures how fast prices are moving on a 0–100 scale.
+- **Above 70**: Overbought — stock may be due for a pullback. *−10 pts.*
+- **Below 30**: Oversold — stock may bounce. *+10 pts.*
+- **40–65**: Healthy neutral-to-bullish momentum zone. *+5 pts.*
+- **65–70 or 30–40**: Caution zone. *0 pts.*
+
+**MACD (Moving Average Convergence Divergence)**
+Difference between 12-day and 26-day EMA, smoothed by a 9-day signal line.
+- MACD line **above** signal line = bullish momentum building. *+8 pts.*
+- MACD line **below** signal line = bearish momentum. *−5 pts.*
+The histogram shows the gap — wider = stronger momentum.
+
+**Support and Resistance Levels**
+Derived from swing highs/lows in the price history.
+- **Near support** (within 3%): Price has bounce potential. *+5 pts.*
+- **Near resistance** (within 3%): Selling pressure overhead. *−5 pts.*
+Support 1 (S1) = nearest floor; Support 2 (S2) = deeper floor. Resistance 1 (R1) / R2 = nearest ceilings.
+
+**Bollinger Band Width**
+Bands are set at ±2 standard deviations around SMA20. When the bands squeeze together (low width), volatility is compressed — this often precedes a sharp move in either direction. Watch for a breakout.
+
+**ATR — Average True Range**
+Measures the average daily price swing over 14 days. Higher ATR = more volatile stock. Used to size positions and set stop losses: a common rule is stop loss = entry − 1.5× ATR.
+
+**Technical Score thresholds**
+- **Above 60**: Bullish — majority of indicators point positive
+- **40–60**: Neutral — mixed signals, wait for confirmation
+- **Below 40**: Bearish — majority of indicators point negative
+            """)
+
         st.plotly_chart(price_chart(hist_df, selected_ticker, period),
                         use_container_width=True, config={"displayModeBar": True})
 
@@ -820,9 +887,17 @@ Signal thresholds: BUY ≥ 70 · ACCUMULATE 60–70 · HOLD 45–60 · REDUCE 35
         plan, stop_loss, s1, s2, r1, r2 = tranche_plan(action, current_price, support, resistance)
 
         st.markdown("### Tranche Deployment Plan")
+        st.markdown(
+            '<div style="color:#94a3b8;font-size:0.82rem;margin-bottom:8px">'
+            'Capital is split into 3 tranches deployed at <b>progressively lower prices</b> — '
+            'each tranche is at least 5–8% apart. This spreads timing risk: if the stock drops '
+            'further you buy more at better prices, reducing your average cost.'
+            '</div>',
+            unsafe_allow_html=True
+        )
         if plan:
             plan_df = pd.DataFrame(plan)
-            st.dataframe(plan_df, use_container_width=True)
+            st.dataframe(plan_df, use_container_width=True, hide_index=True)
         else:
             st.info("No tranche plan available for the current signal.")
 
@@ -915,8 +990,8 @@ with tab4:
 
     all_options = [f"{sym} — {nm}" for sym, nm in all_tickers]
 
-    # Default: first 20 stocks pre-selected
-    default_sel = all_options[:20]
+    # Default: first 30 stocks pre-selected
+    default_sel = all_options[:30]
 
     selected_stocks = st.multiselect(
         f"Select stocks to load (max 100, {len(all_tickers)} available in {uni_choice})",
@@ -1099,7 +1174,14 @@ with tab4:
                 f"(Aggressive weights: Enterprise Market Value 45% / Price to Earnings 45% / Future Cash Flow 10%)"
             )
 
-        # Colour the % Upside column
+        # Format and colour the table
+        # Round all numeric float columns to 2 decimal places before display
+        float_cols = df_show.select_dtypes(include="float").columns.tolist()
+        for col in float_cols:
+            df_show[col] = df_show[col].apply(
+                lambda x: round(x, 2) if pd.notna(x) else x
+            )
+
         if "% Upside" in df_show.columns:
             def color_upside(val):
                 if pd.isna(val): return ""
@@ -1107,7 +1189,15 @@ with tab4:
                 if val < -15: return "color: #ef4444; font-weight:600"
                 return "color: #eab308"
 
-            styled = df_show.style.applymap(color_upside, subset=["% Upside"])
+            # Build format dict for all float cols (2 decimal places)
+            fmt = {col: "{:.2f}" for col in float_cols if col != "% Upside"}
+            fmt["% Upside"] = "{:.2f}"
+
+            styled = (
+                df_show.style
+                .applymap(color_upside, subset=["% Upside"])
+                .format(fmt, na_rep="N/A")
+            )
             st.dataframe(styled, use_container_width=True, height=500)
         else:
             st.dataframe(df_show, use_container_width=True, height=500)

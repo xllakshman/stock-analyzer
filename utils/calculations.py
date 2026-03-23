@@ -408,38 +408,130 @@ def investment_decision(fund_score: int, tech_score: int):
 
 
 def tranche_plan(action, current_price, support_levels, resistance_levels):
-    """Generate tranche deployment / exit plan."""
-    s1 = support_levels[0]    if len(support_levels) > 0 else current_price * 0.92
-    s2 = support_levels[1]    if len(support_levels) > 1 else current_price * 0.85
-    r1 = resistance_levels[0] if len(resistance_levels) > 0 else current_price * 1.08
-    r2 = resistance_levels[1] if len(resistance_levels) > 1 else current_price * 1.15
+    """
+    Generate tranche deployment / exit plan.
 
-    stop_loss = round(min(s2 * 0.97, current_price * 0.85), 2)
+    Key fix: support levels from price history may be ABOVE current price when
+    a stock has broken down below historical lows.  We filter to strictly-below
+    levels and enforce a minimum spread between tranches so the plan is
+    actionable and actually mitigates timing risk.
+
+    BUY tranches spread ~7% and ~15% below current price.
+    SELL tranches spread ~8% and ~15% above current price.
+    """
+    # ── Supports: only levels strictly BELOW current price ─────────────────
+    below_s = sorted(
+        [s for s in support_levels if s < current_price * 0.995],
+        reverse=True   # nearest (highest) first
+    )
+
+    # Tranche 2: nearest support that is at least 5% below current
+    deep_enough_s1 = [s for s in below_s if (current_price - s) / current_price >= 0.05]
+    if deep_enough_s1:
+        s1 = round(deep_enough_s1[0], 2)
+    else:
+        s1 = round(current_price * 0.93, 2)   # default: 7% pullback
+
+    # Tranche 3: support at least 10% below current (meaningfully deeper)
+    deep_enough_s2 = [s for s in below_s if (current_price - s) / current_price >= 0.10]
+    if deep_enough_s2:
+        s2 = round(deep_enough_s2[0], 2)
+    else:
+        s2 = round(current_price * 0.85, 2)   # default: 15% pullback
+
+    # Guarantee s1 > s2 (s1 is closer, s2 is deeper)
+    if s1 <= s2:
+        s1 = round(current_price * 0.93, 2)
+        s2 = round(current_price * 0.85, 2)
+
+    # ── Resistances: only levels strictly ABOVE current price ──────────────
+    above_r = sorted(
+        [r for r in resistance_levels if r > current_price * 1.005]
+    )
+
+    r1_candidates = [r for r in above_r if (r - current_price) / current_price >= 0.05]
+    r1 = round(r1_candidates[0], 2) if r1_candidates else round(current_price * 1.08, 2)
+
+    r2_candidates = [r for r in above_r if (r - current_price) / current_price >= 0.12]
+    r2 = round(r2_candidates[0], 2) if r2_candidates else round(current_price * 1.15, 2)
+
+    if r1 >= r2:
+        r1 = round(current_price * 1.08, 2)
+        r2 = round(current_price * 1.15, 2)
+
+    # ── Stop loss: just below the deep support (s2) ────────────────────────
+    stop_loss = round(s2 * 0.97, 2)
+
+    # ── Compute % distances for display ────────────────────────────────────
+    s1_pct = round((current_price - s1) / current_price * 100, 1)
+    s2_pct = round((current_price - s2) / current_price * 100, 1)
+    r1_pct = round((r1 - current_price) / current_price * 100, 1)
+    r2_pct = round((r2 - current_price) / current_price * 100, 1)
 
     if action in ("BUY", "ACCUMULATE"):
         plan = [
-            {"Tranche": "1st Buy", "% Capital": "30%", "Price Level": f"${current_price:.2f}",
-             "Condition": "Enter now", "Rationale": "At fair/undervalued level"},
-            {"Tranche": "2nd Buy", "% Capital": "30%", "Price Level": f"${s1:.2f}",
-             "Condition": f"Price drops to ${s1:.2f}", "Rationale": "Add at Support 1"},
-            {"Tranche": "3rd Buy", "% Capital": "40%", "Price Level": f"${s2:.2f}",
-             "Condition": f"Price drops to ${s2:.2f}", "Rationale": "Full position at deep value"},
+            {
+                "Tranche":     "1st Buy — 30%",
+                "Price Level": f"${current_price:.2f}",
+                "Trigger":     "Enter now at current price",
+                "Rationale":   "Fair/undervalued entry — initiate position",
+                "Risk":        "Baseline entry risk",
+            },
+            {
+                "Tranche":     "2nd Buy — 30%",
+                "Price Level": f"${s1:.2f}",
+                "Trigger":     f"Price drops -{s1_pct}% to ${s1:.2f}",
+                "Rationale":   f"Add at Support 1 — reduces avg cost by ~{s1_pct/2:.1f}%",
+                "Risk":        f"Avg cost reduces if price recovers",
+            },
+            {
+                "Tranche":     "3rd Buy — 40%",
+                "Price Level": f"${s2:.2f}",
+                "Trigger":     f"Price drops -{s2_pct}% to ${s2:.2f}",
+                "Rationale":   f"Maximum allocation at deep value — largest tranche at best price",
+                "Risk":        f"Stop loss at ${stop_loss:.2f} (-{round((current_price-stop_loss)/current_price*100,1)}%)",
+            },
         ]
     elif action == "HOLD":
         plan = [
-            {"Tranche": "No new buy", "% Capital": "—", "Price Level": "—",
-             "Condition": "Monitor", "Rationale": "Wait for breakout or pullback"},
-            {"Tranche": "Trim 20%",   "% Capital": "20%", "Price Level": f"${r1:.2f}",
-             "Condition": f"Price reaches ${r1:.2f}", "Rationale": "Book partial profits at R1"},
+            {
+                "Tranche":     "Hold — no new buy",
+                "Price Level": "—",
+                "Trigger":     "Monitor for direction",
+                "Rationale":   "Wait for breakout above resistance or pullback to support",
+                "Risk":        "No new capital deployed",
+            },
+            {
+                "Tranche":     "Trim 20% on rally",
+                "Price Level": f"${r1:.2f}",
+                "Trigger":     f"Price rises +{r1_pct}% to ${r1:.2f}",
+                "Rationale":   "Book partial profits at Resistance 1",
+                "Risk":        "Reduces position size; keeps core holding",
+            },
         ]
     else:  # REDUCE / SELL
         plan = [
-            {"Tranche": "Trim 30%", "% Capital": "30%", "Price Level": f"${r1:.2f}",
-             "Condition": f"Price at/above ${r1:.2f}", "Rationale": "Reduce at Resistance 1"},
-            {"Tranche": "Trim 40%", "% Capital": "40%", "Price Level": f"${r2:.2f}",
-             "Condition": f"Price at/above ${r2:.2f}", "Rationale": "Further reduction at R2"},
-            {"Tranche": "Exit 30%", "% Capital": "30%", "Price Level": f"${stop_loss:.2f}",
-             "Condition": f"Stop loss hit ${stop_loss:.2f}", "Rationale": "Full exit on stop"},
+            {
+                "Tranche":     "Trim 30%",
+                "Price Level": f"${r1:.2f}",
+                "Trigger":     f"Price at/above +{r1_pct}% (${r1:.2f})",
+                "Rationale":   "Reduce at Resistance 1 — lock in gains",
+                "Risk":        "Partial exit reduces downside exposure",
+            },
+            {
+                "Tranche":     "Trim 40%",
+                "Price Level": f"${r2:.2f}",
+                "Trigger":     f"Price at/above +{r2_pct}% (${r2:.2f})",
+                "Rationale":   "Further reduction at Resistance 2",
+                "Risk":        "Only 30% position remaining",
+            },
+            {
+                "Tranche":     "Full Exit 30%",
+                "Price Level": f"${stop_loss:.2f}",
+                "Trigger":     f"Stop loss hit (${stop_loss:.2f})",
+                "Rationale":   "Capital protection — exit remaining position",
+                "Risk":        "Maximum loss capped at stop level",
+            },
         ]
 
     return plan, stop_loss, s1, s2, r1, r2
