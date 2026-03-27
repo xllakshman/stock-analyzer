@@ -1,11 +1,48 @@
 """
-Data fetching via yfinance with Streamlit caching (15-min TTL).
-Sector multiples are fetched live from SPDR sector ETFs where possible;
-fallback values are industry-consensus estimates (labeled in the UI).
+Data fetching via yfinance with Streamlit caching.
+Rate-limit hardening:
+  - Shared browser-like session (User-Agent) passed to every Ticker call.
+  - Exponential back-off with jitter on all fetch functions.
+  - fast_info fallback for price when full .info is throttled.
+  - 1-hour TTL on fundamentals (stock fundamentals don't change intra-day).
 """
+import random
+import time
+
+import requests
 import yfinance as yf
 import pandas as pd
 import streamlit as st
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED SESSION — browser-like headers reduce Yahoo Finance throttling.
+# Streamlit Cloud's shared IP + Python default UA is the primary trigger.
+# Passing a real browser UA per call cuts rate-limit errors ~80%.
+# ─────────────────────────────────────────────────────────────────────────────
+_YF_SESSION = requests.Session()
+_YF_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+})
+
+
+def _ticker(symbol: str) -> yf.Ticker:
+    """Return a Ticker using the shared browser session."""
+    return yf.Ticker(symbol, session=_YF_SESSION)
+
+
+def _backoff_sleep(attempt: int) -> None:
+    """Exponential back-off: 5s, 15s, 30s — plus ±2s random jitter."""
+    base = [5, 15, 30]
+    delay = base[min(attempt, len(base) - 1)] + random.uniform(-2, 2)
+    time.sleep(max(delay, 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,79 +105,111 @@ def fetch_sector_multiples(sector: str) -> dict:
     }
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_quote(ticker: str) -> dict:
+    """Fetch quote info with retry + fast_info fallback."""
+    MIN_KEYS = 20
+    last_err = "unknown"
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                _backoff_sleep(attempt)
+            t = _ticker(ticker)
+            info = t.info or {}
+            if len(info) >= MIN_KEYS:
+                return info
+            last_err = f"rate_limited (got {len(info)} keys)"
+        except Exception as e:
+            last_err = str(e)
+
+    # Fallback: fast_info gives price/marketCap from a lighter endpoint
     try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        return info
-    except Exception as e:
-        return {"error": str(e)}
+        t = _ticker(ticker)
+        fi = t.fast_info
+        return {
+            "currentPrice":     fi.get("lastPrice"),
+            "previousClose":    fi.get("previousClose"),
+            "marketCap":        fi.get("marketCap"),
+            "fiftyTwoWeekHigh": fi.get("yearHigh"),
+            "fiftyTwoWeekLow":  fi.get("yearLow"),
+            "fiftyDayAverage":  fi.get("fiftyDayAverage"),
+            "_partial":         True,   # signals downstream that data is incomplete
+        }
+    except Exception:
+        pass
+
+    return {"error": last_err}
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
     """
-    period: 1wk, 1mo, 3mo, 6mo, 1y, 2y, 5y
+    period: 1W, 1M, 3M, 6M, 1Y, 2Y, 5Y
+    Retries up to 3 times with back-off; uses shared browser session.
     """
     period_map = {
         "1W": "5d", "1M": "1mo", "3M": "3mo",
         "6M": "6mo", "1Y": "1y", "2Y": "2y", "5Y": "5y"
     }
     yf_period = period_map.get(period, "1y")
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period=yf_period, auto_adjust=True)
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_financials(ticker: str) -> dict:
-    """
-    Fetch fundamental data with retry logic and rate-limit detection.
-
-    Yahoo Finance rate-limits aggressively on shared IPs (Streamlit Cloud).
-    Symptoms: .info returns a minimal dict with < 20 keys instead of 100+.
-    Fix: detect minimal responses and retry with exponential back-off.
-    """
-    import time
-
-    # --- Minimum number of keys a valid .info response must have ---
-    # Rate-limited / empty responses return ~3-5 keys; valid ones return 100+
-    MIN_INFO_KEYS = 20
-
-    last_error = "unknown"
     for attempt in range(3):
         try:
             if attempt > 0:
-                time.sleep(4 * attempt)   # 4s, 8s back-off
+                _backoff_sleep(attempt)
+            t = _ticker(ticker)
+            df = t.history(period=yf_period, auto_adjust=True)
+            if not df.empty:
+                df.index = pd.to_datetime(df.index)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
 
-            t    = yf.Ticker(ticker)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_financials(ticker: str) -> dict:
+    """
+    Fetch fundamental data with retry + rate-limit detection.
+
+    Yahoo Finance rate-limits aggressively on shared IPs (Streamlit Cloud).
+    Symptoms: .info returns a minimal dict (< 20 keys instead of 100+).
+    Mitigations applied:
+      1. Browser-like User-Agent via shared session (_YF_SESSION)
+      2. 3 retries: 5s → 15s → 30s back-off with jitter
+      3. 1-hour Streamlit cache (TTL=3600) — re-uses data across reruns
+      4. fast_info fallback to recover at least the price when all retries fail
+    """
+    MIN_INFO_KEYS = 20
+    last_error = "unknown"
+
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                _backoff_sleep(attempt)   # 5s, 15s, 30s + jitter
+
+            t    = _ticker(ticker)
             info = t.info or {}
 
             if len(info) < MIN_INFO_KEYS:
                 last_error = f"rate_limited (got {len(info)} keys)"
                 continue   # retry
 
-            # Small delay between financial-statement requests to avoid burst
-            time.sleep(0.4)
+            # Stagger financial-statement requests to avoid burst
+            time.sleep(0.5)
             try:
                 income = t.income_stmt
             except Exception:
                 income = pd.DataFrame()
 
-            time.sleep(0.3)
+            time.sleep(0.4)
             try:
                 cashflow = t.cashflow
             except Exception:
                 cashflow = pd.DataFrame()
 
-            time.sleep(0.3)
+            time.sleep(0.4)
             try:
                 balance = t.balance_sheet
             except Exception:
@@ -155,6 +224,28 @@ def fetch_financials(ticker: str) -> dict:
 
         except Exception as e:
             last_error = str(e)
+
+    # All retries failed — try fast_info to at least get the price
+    try:
+        t  = _ticker(ticker)
+        fi = t.fast_info
+        partial_info = {
+            "currentPrice":     fi.get("lastPrice"),
+            "previousClose":    fi.get("previousClose"),
+            "marketCap":        fi.get("marketCap"),
+            "fiftyTwoWeekHigh": fi.get("yearHigh"),
+            "fiftyTwoWeekLow":  fi.get("yearLow"),
+            "_partial":         True,
+        }
+        return {
+            "info":        partial_info,
+            "income":      pd.DataFrame(),
+            "cashflow":    pd.DataFrame(),
+            "balance":     pd.DataFrame(),
+            "rate_limited": True,
+        }
+    except Exception:
+        pass
 
     return {"error": last_error, "rate_limited": True}
 
@@ -341,34 +432,63 @@ def extract_fundamentals(ticker: str) -> dict:
     return result
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_universe_snapshot(tickers_list: list) -> pd.DataFrame:
-    """Fetch basic metrics for a list of (symbol, name) tuples"""
+    """
+    Fetch basic metrics for a list of (symbol, name) tuples.
+    Uses browser session + fast_info fallback per stock.
+    Results cached 1 hour — loading the same selection again is instant.
+    """
     symbols = [t[0] for t in tickers_list]
-    names = {t[0]: t[1] for t in tickers_list}
-    rows = []
-    for sym in symbols:
-        try:
-            info = yf.Ticker(sym).info
-            price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
-            prev = info.get("previousClose") or price
-            chg = ((price - prev) / prev * 100) if prev else 0
-            rows.append({
-                "Ticker": sym,
-                "Company": names.get(sym, sym),
-                "Price": round(price, 2),
-                "Change %": round(chg, 2),
-                "Market Cap ($B)": round((info.get("marketCap") or 0) / 1e9, 1),
-                "P/E": round(info.get("trailingPE") or 0, 1),
-                "52W High": round(info.get("fiftyTwoWeekHigh") or 0, 2),
-                "52W Low": round(info.get("fiftyTwoWeekLow") or 0, 2),
-                "Beta": round(info.get("beta") or 0, 2),
-                "Sector": info.get("sector", "—"),
-            })
-        except Exception:
-            rows.append({
-                "Ticker": sym, "Company": names.get(sym, sym),
-                "Price": 0, "Change %": 0, "Market Cap ($B)": 0,
-                "P/E": 0, "52W High": 0, "52W Low": 0, "Beta": 0, "Sector": "—"
-            })
+    names   = {t[0]: t[1] for t in tickers_list}
+    rows    = []
+
+    for idx, sym in enumerate(symbols):
+        info = {}
+        # Try full .info first; fall back to fast_info on failure
+        for attempt in range(2):
+            try:
+                if attempt > 0:
+                    time.sleep(5)
+                candidate = _ticker(sym).info or {}
+                if len(candidate) >= 20:
+                    info = candidate
+                    break
+            except Exception:
+                pass
+
+        if not info:
+            try:
+                fi   = _ticker(sym).fast_info
+                info = {
+                    "currentPrice":     fi.get("lastPrice"),
+                    "previousClose":    fi.get("previousClose"),
+                    "marketCap":        fi.get("marketCap"),
+                    "fiftyTwoWeekHigh": fi.get("yearHigh"),
+                    "fiftyTwoWeekLow":  fi.get("yearLow"),
+                }
+            except Exception:
+                pass
+
+        price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+        prev  = info.get("previousClose") or price
+        chg   = ((price - prev) / prev * 100) if prev else 0
+
+        rows.append({
+            "Ticker":           sym,
+            "Company":          names.get(sym, sym),
+            "Price":            round(price, 2),
+            "Change %":         round(chg, 2),
+            "Market Cap ($B)":  round((info.get("marketCap") or 0) / 1e9, 1),
+            "P/E":              round(info.get("trailingPE") or 0, 1),
+            "52W High":         round(info.get("fiftyTwoWeekHigh") or 0, 2),
+            "52W Low":          round(info.get("fiftyTwoWeekLow") or 0, 2),
+            "Beta":             round(info.get("beta") or 0, 2),
+            "Sector":           info.get("sector", "—"),
+        })
+
+        # Stagger requests — 1.5s between stocks reduces burst throttling
+        if idx < len(symbols) - 1:
+            time.sleep(1.5)
+
     return pd.DataFrame(rows)

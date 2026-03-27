@@ -1031,7 +1031,7 @@ with tab4:
     )
 
     if selected_stocks and need_load:
-        import yfinance as yf
+        from utils.data import _ticker as _yf_ticker   # shared browser-session Ticker
         rows     = []
         n        = len(sel_symbols)
         progress = st.progress(0)
@@ -1061,13 +1061,21 @@ with tab4:
             progress.progress((idx_s + 1) / n)
 
             try:
-                info = yf.Ticker(sym).info or {}
+                # Use browser-session Ticker; retry once with 5s pause on rate-limit
+                info = _yf_ticker(sym).info or {}
                 MIN_KEYS = 20
                 if len(info) < MIN_KEYS:
-                    # Soft rate-limit — skip but record
-                    rows.append({"Ticker": sym, "Company": sym_name_map.get(sym, sym),
-                                 "Price": None, "Note": "Rate limited"})
-                    time.sleep(2)
+                    time.sleep(5)
+                    info = _yf_ticker(sym).info or {}
+                if len(info) < MIN_KEYS:
+                    # Still rate-limited after retry — try fast_info for price only
+                    try:
+                        fi = _yf_ticker(sym).fast_info
+                        rows.append({"Ticker": sym, "Company": sym_name_map.get(sym, sym),
+                                     "Price": round(fi.get("lastPrice") or 0, 2), "Note": "Partial (rate limited)"})
+                    except Exception:
+                        rows.append({"Ticker": sym, "Company": sym_name_map.get(sym, sym),
+                                     "Price": None, "Note": "Rate limited"})
                     continue
 
                 px     = info.get("currentPrice") or info.get("regularMarketPrice")
@@ -1144,10 +1152,9 @@ with tab4:
                 rows.append({"Ticker": sym, "Company": sym_name_map.get(sym, sym),
                              "Price": None, "Note": str(ex)[:40]})
 
-            # Rate-limit pause every 8 stocks
-            if (idx_s + 1) % 8 == 0 and idx_s + 1 < n:
-                status.text(f"Pausing 3s to avoid rate limits... ({idx_s + 1}/{n} done)")
-                time.sleep(3)
+            # 1.5s between every stock — prevents burst throttling on shared IP
+            if idx_s + 1 < n:
+                time.sleep(1.5)
 
         progress.empty()
         status.empty()
