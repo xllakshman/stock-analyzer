@@ -1,6 +1,6 @@
 """
 Stock Analyzer — Streamlit App
-Covers NASDAQ 100, S&P 100, NIFTY 100
+Search any US or India stock by ticker or company name.
 Run: streamlit run app.py
 """
 import streamlit as st
@@ -71,10 +71,6 @@ RISK_PRESETS = {
         "dcf_growth": None,
     },
 }
-
-# Universe browser always uses Aggressive weights (gives broadest upside signal)
-UNIVERSE_WEIGHTS    = RISK_PRESETS["Aggressive"]["weights"]
-UNIVERSE_DCF_GROWTH = RISK_PRESETS["Aggressive"]["dcf_growth"] / 100
 
 # Human-readable weight key names
 WEIGHT_LABELS = {
@@ -308,23 +304,75 @@ with st.sidebar:
     st.markdown("## Stock Analyzer")
     st.markdown("---")
 
-    universe = st.selectbox(
-        "Stock Universe",
-        ["Custom Ticker", "NASDAQ 100", "S&P 100", "NIFTY 100"],
-        key="universe"
-    )
+    # Build suggestion index from known universe lists (NASDAQ 100, S&P 100, NIFTY 100)
+    # Used for autocomplete only — any ticker can be entered directly regardless.
+    _known_stocks = {}
+    for _uni in ["NASDAQ 100", "S&P 100", "NIFTY 100"]:
+        for _sym, _nm in UNIVERSE_MAP[_uni]:
+            if _sym not in _known_stocks:
+                _known_stocks[_sym] = _nm
 
-    if universe == "Custom Ticker":
-        ticker_input    = st.text_input("Enter Ticker", value="AAPL", key="custom_ticker").upper().strip()
-        selected_ticker = ticker_input
-        selected_name   = ticker_input
+    if "recent_searches" not in st.session_state:
+        st.session_state["recent_searches"] = []
+
+    search_query = st.text_input(
+        "🔍 Search any US or India stock",
+        placeholder="Ticker or company — e.g. AAPL, HDFC, TCS.NS, Tesla...",
+        key="stock_search"
+    ).strip()
+
+    selected_ticker = None
+    selected_name   = None
+
+    if search_query:
+        q = search_query.upper()
+
+        # Find autocomplete suggestions from known lists
+        if q in _known_stocks:
+            _suggestions = [(q, _known_stocks[q])]
+        else:
+            _prefix  = [(s, n) for s, n in _known_stocks.items() if s.startswith(q)]
+            _name_m  = [(s, n) for s, n in _known_stocks.items()
+                        if search_query.lower() in n.lower() and (s, n) not in _prefix]
+            _suggestions = _prefix + _name_m
+
+        if not _suggestions:
+            # Not in suggestion lists — pass directly to Yahoo Finance (any global ticker)
+            selected_ticker = q
+            selected_name   = q
+        elif len(_suggestions) == 1:
+            selected_ticker = _suggestions[0][0]
+            selected_name   = _suggestions[0][1]
+            st.caption(f"✓ {selected_name} ({selected_ticker})")
+        else:
+            # Show top 20 matches + always allow the raw query as direct entry
+            _opts = [f"{s} — {n}" for s, n in _suggestions[:20]]
+            _opts.append(f"{q} — (enter directly)")
+            _pick = st.selectbox("Select from suggestions", _opts, key="stock_picker")
+            if _pick.endswith("(enter directly)"):
+                selected_ticker = q
+                selected_name   = q
+            else:
+                _idx = _opts.index(_pick)
+                selected_ticker = _suggestions[_idx][0]
+                selected_name   = _suggestions[_idx][1]
+
+        # Track recent searches
+        if selected_ticker and selected_ticker not in st.session_state["recent_searches"]:
+            st.session_state["recent_searches"].insert(0, selected_ticker)
+            st.session_state["recent_searches"] = st.session_state["recent_searches"][:5]
+
+    elif st.session_state.get("recent_searches"):
+        # No query typed — offer recent searches
+        _recent_pick = st.selectbox(
+            "Recent searches", st.session_state["recent_searches"], key="recent_picker"
+        )
+        selected_ticker = _recent_pick
+        selected_name   = _known_stocks.get(_recent_pick, _recent_pick)
     else:
-        tickers_list    = UNIVERSE_MAP[universe]
-        options         = [f"{sym} — {name}" for sym, name in tickers_list]
-        selected_option = st.selectbox("Select Stock", options, key="stock_picker")
-        idx             = options.index(selected_option)
-        selected_ticker = tickers_list[idx][0]
-        selected_name   = tickers_list[idx][1]
+        # First ever load — default to AAPL
+        selected_ticker = "AAPL"
+        selected_name   = "Apple Inc."
 
     st.markdown("---")
     period = st.radio("Chart Period", ["1W", "1M", "3M", "6M", "1Y", "2Y", "5Y"],
@@ -443,11 +491,10 @@ st.markdown(f"""
 # ──────────────────────────────────────────────────────────────
 # TABS
 # ──────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "Fundamental Analysis",
     "Technical Analysis",
     "Investment Decision",
-    "Universe Browser",
     "Glossary",
 ])
 
@@ -968,263 +1015,9 @@ Signal thresholds: BUY ≥ 70 · ACCUMULATE 60–70 · HOLD 45–60 · REDUCE 35
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 4: UNIVERSE BROWSER
+# TAB 4: GLOSSARY
 # ══════════════════════════════════════════════════════════════
 with tab4:
-    st.markdown("### Stock Universe Browser")
-
-    takeaway_box(
-        "Select individual stocks from any index universe to compare. "
-        "Fair values use Aggressive weights (Enterprise Market Value 45%, Price to Earnings 45%, "
-        "Future Cash Flow Value 10% at 20% growth). "
-        "Load in batches of up to 20 stocks at a time to stay within Yahoo Finance rate limits. "
-        "Results are cached — switch tabs and come back without re-fetching."
-    )
-
-    uni_choice = st.selectbox(
-        "Select Universe",
-        ["NASDAQ 100", "S&P 100", "NIFTY 100"],
-        key="universe_browse"
-    )
-    all_tickers = UNIVERSE_MAP[uni_choice]   # list of (sym, name)
-
-    all_options = [f"{sym} — {nm}" for sym, nm in all_tickers]
-
-    # Default: first 30 stocks pre-selected
-    default_sel = all_options[:30]
-
-    selected_stocks = st.multiselect(
-        f"Select stocks to load (max 100, {len(all_tickers)} available in {uni_choice})",
-        options=all_options,
-        default=default_sel,
-        key="uni_multiselect",
-        help="Choose individual stocks. Loading 20+ at a time may take 1–2 minutes due to Yahoo Finance rate limits."
-    )
-
-    if len(selected_stocks) > 100:
-        st.warning("Maximum 100 stocks at a time. Only the first 100 will be loaded.")
-        selected_stocks = selected_stocks[:100]
-
-    # Symbol → name lookup
-    sym_name_map = {sym: nm for sym, nm in all_tickers}
-
-    col_load, col_clear = st.columns([2, 1])
-    load_btn  = col_load.button("Load Selected Stocks", type="primary")
-    clear_btn = col_clear.button("Clear Results")
-
-    if clear_btn:
-        st.session_state.pop("uni_results_df", None)
-        st.session_state.pop("uni_results_key", None)
-
-    # Cache key: sorted list of selected symbols + universe name
-    sel_symbols  = [s.split(" — ")[0] for s in selected_stocks]
-    cache_key    = uni_choice + "|" + ",".join(sorted(sel_symbols))
-
-    # Load if button pressed or if cache key matches
-    if load_btn:
-        st.session_state.pop("uni_results_df", None)   # force refresh
-
-    need_load = (
-        load_btn or
-        ("uni_results_df" not in st.session_state) or
-        (st.session_state.get("uni_results_key") != cache_key)
-    )
-
-    if selected_stocks and need_load:
-        from utils.data import _ticker as _yf_ticker   # shared browser-session Ticker
-        rows     = []
-        n        = len(sel_symbols)
-        progress = st.progress(0)
-        status   = st.empty()
-
-        HARDCODED_SECTOR_PE = {
-            "Technology": 28, "Consumer Cyclical": 22, "Financial Services": 14,
-            "Healthcare": 20, "Communication Services": 22, "Industrials": 18,
-            "Consumer Defensive": 18, "Energy": 12, "Utilities": 15,
-            "Basic Materials": 14, "Real Estate": 20, "default": 18,
-        }
-        HARDCODED_EV_EBITDA = {
-            "Technology": 20, "Consumer Cyclical": 14, "Financial Services": 12,
-            "Healthcare": 15, "Communication Services": 16, "Industrials": 13,
-            "Consumer Defensive": 12, "Energy": 7, "Utilities": 10,
-            "Basic Materials": 9, "Real Estate": 18, "default": 13,
-        }
-        HARDCODED_PB = {
-            "Technology": 6, "Consumer Cyclical": 4, "Financial Services": 1.4,
-            "Healthcare": 5, "Communication Services": 4, "Industrials": 3,
-            "Consumer Defensive": 3.5, "Energy": 2, "Utilities": 1.5,
-            "Basic Materials": 2, "Real Estate": 1.8, "default": 3,
-        }
-
-        for idx_s, sym in enumerate(sel_symbols):
-            status.text(f"Loading {sym} ({idx_s + 1}/{n})...")
-            progress.progress((idx_s + 1) / n)
-
-            try:
-                # Use browser-session Ticker; retry once with 5s pause on rate-limit
-                info = _yf_ticker(sym).info or {}
-                MIN_KEYS = 20
-                if len(info) < MIN_KEYS:
-                    time.sleep(5)
-                    info = _yf_ticker(sym).info or {}
-                if len(info) < MIN_KEYS:
-                    # Still rate-limited after retry — try fast_info for price only
-                    try:
-                        fi = _yf_ticker(sym).fast_info
-                        rows.append({"Ticker": sym, "Company": sym_name_map.get(sym, sym),
-                                     "Price": round(fi.get("lastPrice") or 0, 2), "Note": "Partial (rate limited)"})
-                    except Exception:
-                        rows.append({"Ticker": sym, "Company": sym_name_map.get(sym, sym),
-                                     "Price": None, "Note": "Rate limited"})
-                    continue
-
-                px     = info.get("currentPrice") or info.get("regularMarketPrice")
-                eps_t  = info.get("trailingEps")
-                eps_f  = info.get("forwardEps")
-                bv     = info.get("bookValue")
-                ebitda_i = info.get("ebitda")
-                shares_i = info.get("sharesOutstanding")
-                ev_i   = info.get("enterpriseValue")
-                fcf_i  = info.get("freeCashflow")
-                sec    = info.get("sector", "default")
-                net_d  = (info.get("totalDebt") or 0) - (info.get("totalCash") or 0)
-
-                sec_pe  = HARDCODED_SECTOR_PE.get(sec, HARDCODED_SECTOR_PE["default"])
-                sec_ev  = HARDCODED_EV_EBITDA.get(sec, HARDCODED_EV_EBITDA["default"])
-                sec_pb  = HARDCODED_PB.get(sec, HARDCODED_PB["default"])
-
-                # Compute fair values
-                g_val  = graham_number(eps_t, bv)
-                d_val  = dcf_valuation(fcf_i, UNIVERSE_DCF_GROWTH, shares_i)
-                p_val, _ = pe_based_valuation(eps_t, eps_f, sec_pe)
-                e_val  = ev_ebitda_valuation(ebitda_i, net_d, shares_i, sec_ev)
-                b_val  = pb_valuation(bv, sec_pb)
-
-                comp   = composite_fair_value(
-                    {"graham": g_val, "dcf": d_val, "pe": p_val, "ev": e_val, "pb": b_val, "ddm": None},
-                    UNIVERSE_WEIGHTS
-                )
-
-                upside = round((comp - px) / px * 100, 2) if comp and px else None
-
-                if upside is not None:
-                    if upside > 15:
-                        signal = "Undervalued"
-                    elif upside < -15:
-                        signal = "Overvalued"
-                    else:
-                        signal = "Fair Value"
-                else:
-                    signal = "N/A"
-
-                ana_rec  = (info.get("recommendationKey") or "").upper().replace("_", " ")
-                ana_tgt  = info.get("targetMeanPrice")
-                roe_i    = info.get("returnOnEquity")
-                roce_i   = info.get("returnOnAssets")   # Proxy (ROCE needs statements)
-                margin_i = info.get("profitMargins")
-                rev_g    = info.get("revenueGrowth")
-
-                entry = round(comp * 0.97, 2) if comp else None
-                exit_ = round(ana_tgt if ana_tgt else (comp * 1.15 if comp else None), 2) if (ana_tgt or comp) else None
-
-                rows.append({
-                    "Ticker":              sym,
-                    "Company":             sym_name_map.get(sym, sym),
-                    "Price":               round(px, 2) if px else None,
-                    "Safe Value":          round(g_val, 2) if g_val else None,
-                    "Future Cash Flow":    round(d_val, 2) if d_val else None,
-                    "Price to Earnings":   round(p_val, 2) if p_val else None,
-                    "Ent. Market Value":   round(e_val, 2) if e_val else None,
-                    "Composite Fair Value": round(comp, 2) if comp else None,
-                    "% Upside":            upside,
-                    "Signal":              signal,
-                    "Analyst Rec":         ana_rec or "N/A",
-                    "Analyst Target":      round(ana_tgt, 2) if ana_tgt else None,
-                    "Entry Point":         entry,
-                    "Exit Point":          exit_,
-                    "ROE %":               round(roe_i * 100, 2) if roe_i else None,
-                    "ROCE % (Approx)":     round(roce_i * 100, 2) if roce_i else None,
-                    "Rev Growth %":        round(rev_g * 100, 2) if rev_g else None,
-                    "Net Margin %":        round(margin_i * 100, 2) if margin_i else None,
-                })
-
-            except Exception as ex:
-                rows.append({"Ticker": sym, "Company": sym_name_map.get(sym, sym),
-                             "Price": None, "Note": str(ex)[:40]})
-
-            # 1.5s between every stock — prevents burst throttling on shared IP
-            if idx_s + 1 < n:
-                time.sleep(1.5)
-
-        progress.empty()
-        status.empty()
-
-        if rows:
-            df_uni = pd.DataFrame(rows)
-            st.session_state["uni_results_df"]  = df_uni
-            st.session_state["uni_results_key"] = cache_key
-        else:
-            st.warning("No data returned. Yahoo Finance may be rate-limiting. Try again in 30 seconds.")
-
-    # ── Display results ──
-    if "uni_results_df" in st.session_state and st.session_state.get("uni_results_key") == cache_key:
-        df_show = st.session_state["uni_results_df"].copy()
-
-        # Summary counts
-        if "Signal" in df_show.columns:
-            buys  = (df_show["Signal"] == "Undervalued").sum()
-            sells = (df_show["Signal"] == "Overvalued").sum()
-            holds = (df_show["Signal"] == "Fair Value").sum()
-            st.markdown(
-                f"**{len(df_show)} stocks loaded** — "
-                f"Undervalued: {buys} · Fair Value: {holds} · Overvalued: {sells} "
-                f"(Aggressive weights: Enterprise Market Value 45% / Price to Earnings 45% / Future Cash Flow 10%)"
-            )
-
-        # Format and colour the table
-        # Round all numeric float columns to 2 decimal places before display
-        float_cols = df_show.select_dtypes(include="float").columns.tolist()
-        for col in float_cols:
-            df_show[col] = df_show[col].apply(
-                lambda x: round(x, 2) if pd.notna(x) else x
-            )
-
-        if "% Upside" in df_show.columns:
-            def color_upside(val):
-                if pd.isna(val): return ""
-                if val > 15:  return "color: #22c55e; font-weight:600"
-                if val < -15: return "color: #ef4444; font-weight:600"
-                return "color: #eab308"
-
-            # Build format dict for all float cols (2 decimal places)
-            fmt = {col: "{:.2f}" for col in float_cols if col != "% Upside"}
-            fmt["% Upside"] = "{:.2f}"
-
-            styled = (
-                df_show.style
-                .applymap(color_upside, subset=["% Upside"])
-                .format(fmt, na_rep="N/A")
-            )
-            st.dataframe(styled, use_container_width=True, height=500)
-        else:
-            st.dataframe(df_show, use_container_width=True, height=500)
-
-        # CSV download
-        csv = df_show.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download as CSV",
-            data=csv,
-            file_name=f"{uni_choice.replace(' ', '_')}_universe.csv",
-            mime="text/csv"
-        )
-    elif not selected_stocks:
-        st.info("Select stocks from the multiselect above and click Load Selected Stocks.")
-
-
-# ══════════════════════════════════════════════════════════════
-# TAB 5: GLOSSARY
-# ══════════════════════════════════════════════════════════════
-with tab5:
     st.markdown("## Glossary of Terms")
     st.markdown("All financial terms and indicators used in this app, explained plainly.")
 
