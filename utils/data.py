@@ -1,47 +1,33 @@
 """
 Data fetching via yfinance with Streamlit caching.
+
+yfinance 1.x uses curl_cffi with Chrome impersonation internally.
+Do NOT pass a custom requests.Session — yfinance will reject it.
+Let yfinance manage its own session for best Yahoo Finance compatibility.
+
 Rate-limit hardening:
-  - Shared browser-like session (User-Agent) passed to every Ticker call.
-  - Exponential back-off with jitter on all fetch functions.
+  - yfinance 1.x handles cookie/crumb auth and Chrome impersonation natively.
   - fast_info fallback for price when full .info is throttled.
   - 1-hour TTL on fundamentals (stock fundamentals don't change intra-day).
 """
 import random
 import time
 
-import requests
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError, YFDataException
 import pandas as pd
 import streamlit as st
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED SESSION — browser-like headers reduce Yahoo Finance throttling.
-# Streamlit Cloud's shared IP + Python default UA is the primary trigger.
-# Passing a real browser UA per call cuts rate-limit errors ~80%.
-# ─────────────────────────────────────────────────────────────────────────────
-_YF_SESSION = requests.Session()
-_YF_SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-})
-
 
 def _ticker(symbol: str) -> yf.Ticker:
-    """Return a Ticker using the shared browser session."""
-    return yf.Ticker(symbol, session=_YF_SESSION)
+    """Return a Ticker. No custom session — yfinance 1.x manages curl_cffi internally."""
+    return yf.Ticker(symbol)
 
 
 def _backoff_sleep(attempt: int) -> None:
-    """Exponential back-off: 5s, 15s, 30s — plus ±2s random jitter."""
-    base = [5, 15, 30]
-    delay = base[min(attempt, len(base) - 1)] + random.uniform(-2, 2)
+    """Back-off: 3s, 8s, 15s — plus ±1s random jitter. Shorter than before for UX."""
+    base = [3, 8, 15]
+    delay = base[min(attempt, len(base) - 1)] + random.uniform(-1, 1)
     time.sleep(max(delay, 1))
 
 
@@ -118,9 +104,11 @@ def fetch_quote(ticker: str) -> dict:
             info = t.info or {}
             if len(info) >= MIN_KEYS:
                 return info
-            last_err = f"rate_limited (got {len(info)} keys)"
+            last_err = f"sparse_response (got {len(info)} keys)"
+        except (YFRateLimitError, YFDataException) as e:
+            last_err = f"yf_error: {type(e).__name__}"
         except Exception as e:
-            last_err = str(e)
+            last_err = str(e)[:80]
 
     # Fallback: fast_info gives price/marketCap from a lighter endpoint
     try:
@@ -133,7 +121,7 @@ def fetch_quote(ticker: str) -> dict:
             "fiftyTwoWeekHigh": fi.get("yearHigh"),
             "fiftyTwoWeekLow":  fi.get("yearLow"),
             "fiftyDayAverage":  fi.get("fiftyDayAverage"),
-            "_partial":         True,   # signals downstream that data is incomplete
+            "_partial":         True,
         }
     except Exception:
         pass
@@ -145,7 +133,7 @@ def fetch_quote(ticker: str) -> dict:
 def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
     """
     period: 1W, 1M, 3M, 6M, 1Y, 2Y, 5Y
-    Retries up to 3 times with back-off; uses shared browser session.
+    Retries up to 3 times with back-off.
     """
     period_map = {
         "1W": "5d", "1M": "1mo", "3M": "3mo",
@@ -163,6 +151,8 @@ def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
                 if df.index.tz is not None:
                     df.index = df.index.tz_localize(None)
                 return df
+        except (YFRateLimitError, YFDataException):
+            pass
         except Exception:
             pass
     return pd.DataFrame()
@@ -173,13 +163,12 @@ def fetch_financials(ticker: str) -> dict:
     """
     Fetch fundamental data with retry + rate-limit detection.
 
-    Yahoo Finance rate-limits aggressively on shared IPs (Streamlit Cloud).
-    Symptoms: .info returns a minimal dict (< 20 keys instead of 100+).
-    Mitigations applied:
-      1. Browser-like User-Agent via shared session (_YF_SESSION)
-      2. 3 retries: 5s → 15s → 30s back-off with jitter
-      3. 1-hour Streamlit cache (TTL=3600) — re-uses data across reruns
-      4. fast_info fallback to recover at least the price when all retries fail
+    yfinance 1.x handles cookie/crumb auth and Chrome impersonation via curl_cffi.
+    Mitigations:
+      1. No custom session — let yfinance use curl_cffi (Chrome impersonation).
+      2. 3 retries: 3s → 8s → 15s back-off with jitter.
+      3. 1-hour Streamlit cache (TTL=3600).
+      4. fast_info fallback to recover at least the price when all retries fail.
     """
     MIN_INFO_KEYS = 20
     last_error = "unknown"
@@ -187,29 +176,25 @@ def fetch_financials(ticker: str) -> dict:
     for attempt in range(3):
         try:
             if attempt > 0:
-                _backoff_sleep(attempt)   # 5s, 15s, 30s + jitter
+                _backoff_sleep(attempt)   # 3s, 8s, 15s + jitter
 
             t    = _ticker(ticker)
             info = t.info or {}
 
             if len(info) < MIN_INFO_KEYS:
-                last_error = f"rate_limited (got {len(info)} keys)"
+                last_error = f"sparse_response (got {len(info)} keys)"
                 continue   # retry
 
-            # Stagger financial-statement requests to avoid burst
-            time.sleep(0.5)
             try:
                 income = t.income_stmt
             except Exception:
                 income = pd.DataFrame()
 
-            time.sleep(0.4)
             try:
                 cashflow = t.cashflow
             except Exception:
                 cashflow = pd.DataFrame()
 
-            time.sleep(0.4)
             try:
                 balance = t.balance_sheet
             except Exception:
@@ -222,8 +207,10 @@ def fetch_financials(ticker: str) -> dict:
                 "balance":  balance,
             }
 
+        except (YFRateLimitError, YFDataException) as e:
+            last_error = f"yf_error: {type(e).__name__}"
         except Exception as e:
-            last_error = str(e)
+            last_error = str(e)[:80]
 
     # All retries failed — try fast_info to at least get the price
     try:
@@ -487,8 +474,8 @@ def fetch_universe_snapshot(tickers_list: list) -> pd.DataFrame:
             "Sector":           info.get("sector", "—"),
         })
 
-        # Stagger requests — 1.5s between stocks reduces burst throttling
+        # Small stagger between stocks to reduce burst throttling
         if idx < len(symbols) - 1:
-            time.sleep(1.5)
+            time.sleep(0.5)
 
     return pd.DataFrame(rows)
