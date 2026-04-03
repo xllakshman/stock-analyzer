@@ -93,8 +93,8 @@ def fetch_sector_multiples(sector: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_quote(ticker: str) -> dict:
-    """Fetch quote info with retry + fast_info fallback."""
-    MIN_KEYS = 20
+    """Fetch quote info with retry + fast_info merge + fallback."""
+    MIN_KEYS = 10
     last_err = "unknown"
     for attempt in range(3):
         try:
@@ -103,7 +103,7 @@ def fetch_quote(ticker: str) -> dict:
             t = _ticker(ticker)
             info = t.info or {}
             if len(info) >= MIN_KEYS:
-                return info
+                return _merge_fast_info(info, t)
             last_err = f"sparse_response (got {len(info)} keys)"
         except (YFRateLimitError, YFDataException) as e:
             last_err = f"yf_error: {type(e).__name__}"
@@ -158,19 +158,47 @@ def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _merge_fast_info(info: dict, t: yf.Ticker) -> dict:
+    """
+    yfinance 1.x retired many keys from .info (currentPrice, marketCap,
+    fiftyTwoWeekHigh/Low, previousClose, sharesOutstanding, etc.) and moved
+    them to fast_info. This function injects them back so downstream code
+    that uses the old key names keeps working.
+    """
+    try:
+        fi = t.fast_info
+        retired_map = {
+            "currentPrice":          fi.get("lastPrice"),
+            "regularMarketPrice":    fi.get("lastPrice"),
+            "previousClose":         fi.get("previousClose"),
+            "marketCap":             fi.get("marketCap"),
+            "fiftyTwoWeekHigh":      fi.get("yearHigh"),
+            "fiftyTwoWeekLow":       fi.get("yearLow"),
+            "fiftyDayAverage":       fi.get("fiftyDayAverage"),
+            "twoHundredDayAverage":  fi.get("twoHundredDayAverage"),
+            "sharesOutstanding":     fi.get("shares"),
+            "averageVolume":         fi.get("threeMonthAverageVolume"),
+        }
+        for k, v in retired_map.items():
+            if v is not None:
+                info.setdefault(k, v)   # don't overwrite if .info already has it
+    except Exception:
+        pass
+    return info
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financials(ticker: str) -> dict:
     """
     Fetch fundamental data with retry + rate-limit detection.
 
     yfinance 1.x handles cookie/crumb auth and Chrome impersonation via curl_cffi.
-    Mitigations:
-      1. No custom session — let yfinance use curl_cffi (Chrome impersonation).
-      2. 3 retries: 3s → 8s → 15s back-off with jitter.
-      3. 1-hour Streamlit cache (TTL=3600).
-      4. fast_info fallback to recover at least the price when all retries fail.
+    Key changes vs 0.2.x:
+      - Price/marketCap/52wk fields moved to fast_info; injected back via _merge_fast_info.
+      - MIN_INFO_KEYS lowered to 10: rate-limited response returns 0-5 keys;
+        a real (even partial) response returns 10+.
     """
-    MIN_INFO_KEYS = 20
+    MIN_INFO_KEYS = 10   # rate-limited responses return 0-5 keys; real ones return 10+
     last_error = "unknown"
 
     for attempt in range(3):
@@ -184,6 +212,9 @@ def fetch_financials(ticker: str) -> dict:
             if len(info) < MIN_INFO_KEYS:
                 last_error = f"sparse_response (got {len(info)} keys)"
                 continue   # retry
+
+            # Inject retired price/market fields from fast_info back into info
+            info = _merge_fast_info(info, t)
 
             try:
                 income = t.income_stmt
@@ -212,16 +243,18 @@ def fetch_financials(ticker: str) -> dict:
         except Exception as e:
             last_error = str(e)[:80]
 
-    # All retries failed — try fast_info to at least get the price
+    # All retries failed — try fast_info to recover at least price data
     try:
         t  = _ticker(ticker)
         fi = t.fast_info
         partial_info = {
             "currentPrice":     fi.get("lastPrice"),
+            "regularMarketPrice": fi.get("lastPrice"),
             "previousClose":    fi.get("previousClose"),
             "marketCap":        fi.get("marketCap"),
             "fiftyTwoWeekHigh": fi.get("yearHigh"),
             "fiftyTwoWeekLow":  fi.get("yearLow"),
+            "sharesOutstanding": fi.get("shares"),
             "_partial":         True,
         }
         return {
@@ -269,9 +302,15 @@ def extract_fundamentals(ticker: str) -> dict:
     result["name"] = info.get("longName") or info.get("shortName", ticker)
     result["sector"] = info.get("sector", "default")
     result["industry"] = info.get("industry", "")
+    # currentPrice / marketCap / sharesOutstanding were retired from .info in yfinance 1.x
+    # _merge_fast_info() in fetch_financials injects them back, so they should be present.
     result["current_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
     result["market_cap"] = info.get("marketCap")
     result["shares_outstanding"] = info.get("sharesOutstanding")
+
+    # 52-week range and moving averages — also retired from .info in yfinance 1.x, injected back
+    result["fifty_two_week_high"] = info.get("fiftyTwoWeekHigh")
+    result["fifty_two_week_low"]  = info.get("fiftyTwoWeekLow")
 
     # Valuation inputs
     result["eps"] = info.get("trailingEps")
@@ -361,10 +400,13 @@ def extract_fundamentals(ticker: str) -> dict:
     except Exception:
         result["roce"] = None
 
-    # Leverage
-    result["debt_equity"] = info.get("debtToEquity")
-    if result["debt_equity"]:
-        result["debt_equity"] /= 100  # yfinance returns as %, normalize
+    # Leverage — yfinance returns debtToEquity as a percentage (e.g. 150 = 1.5x D/E)
+    # Guard: if the value is already in decimal form (< 20) assume it was pre-normalized
+    _de = info.get("debtToEquity")
+    if _de is not None:
+        result["debt_equity"] = _de / 100 if _de > 20 else _de
+    else:
+        result["debt_equity"] = None
 
     result["current_ratio"] = info.get("currentRatio")
 
@@ -402,10 +444,6 @@ def extract_fundamentals(ticker: str) -> dict:
     result["dividend_rate"] = info.get("dividendRate")
     result["dividend_yield"] = info.get("dividendYield")
     result["dividend_growth"] = info.get("fiveYearAvgDividendYield")  # proxy
-
-    # 52-week range
-    result["fifty_two_week_high"] = info.get("fiftyTwoWeekHigh")
-    result["fifty_two_week_low"] = info.get("fiftyTwoWeekLow")
 
     # Beta
     result["beta"] = info.get("beta")
