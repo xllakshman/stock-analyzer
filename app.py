@@ -12,6 +12,7 @@ from utils.tickers import UNIVERSE_MAP
 from utils.data import fetch_history, extract_fundamentals, fetch_sector_multiples
 from utils.calculations import (
     graham_number, dcf_valuation, pe_based_valuation,
+    ev_ebit_valuation, fcf_yield_valuation,
     ev_ebitda_valuation, pb_valuation, peg_signal,
     dividend_discount_model, composite_fair_value,
     fundamental_signal, fundamental_score,
@@ -34,35 +35,45 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────────────────────
-# RISK APPETITE PRESETS
-# Aggressive  → highest composite fair value (PE + EV dominate, 20% DCF growth)
-# Moderate    → balanced (DCF-led, moderate growth)
-# Conservative→ lowest composite fair value (Graham anchors, slow-growth DCF)
+# RISK APPETITE PRESETS  (institutional-grade weights)
+#
+# Slot keys:
+#   ev_ebit   = EV/EBIT (operating earnings multiple — PE/HF anchor)
+#   dcf       = Two-stage 10yr DCF with CAPM WACC
+#   pe        = Forward P/E × sector median
+#   ev        = EV/EBITDA × sector median
+#   fcf_yield = FCF Yield-implied price (required return method)
+#   ddm       = Dividend Discount Model (Gordon Growth)
+#
+# Aggressive  → highest composite (EV/EBITDA + forward PE dominate)
+# Moderate    → balanced institutional mix
+# Conservative→ lowest composite (EV/EBIT + DCF + FCF Yield anchor)
 # ──────────────────────────────────────────────────────────────
 RISK_PRESETS = {
     "Aggressive": {
         "desc": (
-            "Growth-focused. Enterprise Market Value and Price to Earnings each take 45%. "
-            "Future Cash Flow Value at 10% with 20% growth assumption. "
-            "Produces the highest composite fair value — suited for high-growth stocks."
+            "Growth-focused. EV/EBITDA 40% + Forward P/E 35% + Two-Stage DCF 25%. "
+            "Excludes operating earnings (EV/EBIT) and FCF Yield — they penalise high-capex "
+            "growth companies. 20% DCF growth rate. Suited for tech, cloud, and platform stocks."
         ),
-        "weights":    {"graham": 0,  "dcf": 10, "pe": 45, "ev": 45, "pb": 0,  "ddm": 0},
+        "weights":    {"ev_ebit": 0,  "dcf": 25, "pe": 35, "ev": 40, "fcf_yield": 0,  "ddm": 0},
         "dcf_growth": 20,
     },
     "Moderate": {
         "desc": (
-            "Balanced. Future Cash Flow Value leads at 40%, supported by Price to Earnings "
-            "and Enterprise Market Value. Small Safe Value buffer. 12% DCF growth rate."
+            "Institutional balanced. EV/EBITDA 35% + Two-Stage DCF 30% + Forward P/E 20% "
+            "+ FCF Yield 15%. Reflects a typical sell-side analyst blended approach. 12% DCF growth."
         ),
-        "weights":    {"graham": 10, "dcf": 40, "pe": 25, "ev": 20, "pb": 5,  "ddm": 0},
+        "weights":    {"ev_ebit": 0,  "dcf": 30, "pe": 20, "ev": 35, "fcf_yield": 15, "ddm": 0},
         "dcf_growth": 12,
     },
     "Conservative": {
         "desc": (
-            "Safety-first. Safe Value and Future Cash Flow Value anchor the composite. "
-            "All six methods active. Lowest composite fair value by design. 8% DCF growth rate."
+            "Safety-first / PE-firm style. EV/EBIT 25% + Two-Stage DCF 35% + P/E 20% "
+            "+ FCF Yield 15% + DDM 5%. EV/EBIT and FCF Yield are the most conservative "
+            "anchors — they strip D&A and demand a return threshold. 8% DCF growth rate."
         ),
-        "weights":    {"graham": 20, "dcf": 35, "pe": 20, "ev": 15, "pb": 5,  "ddm": 5},
+        "weights":    {"ev_ebit": 25, "dcf": 35, "pe": 20, "ev": 0,  "fcf_yield": 15, "ddm": 5},
         "dcf_growth": 8,
     },
     "Custom": {
@@ -74,12 +85,12 @@ RISK_PRESETS = {
 
 # Human-readable weight key names
 WEIGHT_LABELS = {
-    "graham": "Safe Value",
-    "dcf":    "Future Cash Flow",
-    "pe":     "Price to Earnings",
-    "ev":     "Enterprise Market Value",
-    "pb":     "Book Value",
-    "ddm":    "Dividends",
+    "ev_ebit":   "EV / Operating Earnings",
+    "dcf":       "DCF (Two-Stage)",
+    "pe":        "Forward P/E",
+    "ev":        "EV / EBITDA",
+    "fcf_yield": "FCF Yield",
+    "ddm":       "Dividends (DDM)",
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -397,22 +408,22 @@ with st.sidebar:
             unsafe_allow_html=True
         )
     else:
-        dcf_growth_pct = st.slider("DCF Growth Rate (%)", 0, 30, 10, 1, key="dcf_growth_custom")
+        dcf_growth_pct = st.slider("DCF Growth Rate — Stage 1 (%)", 0, 30, 12, 1, key="dcf_growth_custom")
         dcf_growth     = dcf_growth_pct / 100
         st.caption("Set 0 to exclude a method. Weights auto-normalise to 100%.")
-        w_graham = st.slider("Safe Value (Graham)",         0, 100, 15, 5, key="w_graham")
-        w_dcf    = st.slider("Future Cash Flow (DCF)",      0, 100, 30, 5, key="w_dcf")
-        w_pe     = st.slider("Price to Earnings",           0, 100, 25, 5, key="w_pe")
-        w_ev     = st.slider("Enterprise Market Value",     0, 100, 15, 5, key="w_ev")
-        w_pb     = st.slider("Book Value",                  0, 100, 10, 5, key="w_pb")
-        w_ddm    = st.slider("Dividends (DDM)",             0, 100,  5, 5, key="w_ddm")
-        total_w  = w_graham + w_dcf + w_pe + w_ev + w_pb + w_ddm
+        w_ev_ebit  = st.slider("EV / Operating Earnings (EV/EBIT)",  0, 100, 15, 5, key="w_ev_ebit")
+        w_dcf      = st.slider("DCF — Two-Stage 10yr (CAPM WACC)",   0, 100, 30, 5, key="w_dcf")
+        w_pe       = st.slider("Forward P/E × Sector Median",        0, 100, 25, 5, key="w_pe")
+        w_ev       = st.slider("EV / EBITDA × Sector Median",        0, 100, 20, 5, key="w_ev")
+        w_fcf_yld  = st.slider("FCF Yield (Required Return)",        0, 100, 10, 5, key="w_fcf_yield")
+        w_ddm      = st.slider("Dividends (DDM)",                    0, 100,  0, 5, key="w_ddm")
+        total_w    = w_ev_ebit + w_dcf + w_pe + w_ev + w_fcf_yld + w_ddm
         if total_w > 0:
             st.caption(f"Total: {total_w}  — auto-normalises to 100%")
         else:
             st.warning("Set at least one weight > 0")
-        weights = {"graham": w_graham, "dcf": w_dcf, "pe": w_pe,
-                   "ev": w_ev,         "pb": w_pb,   "ddm": w_ddm}
+        weights = {"ev_ebit": w_ev_ebit, "dcf": w_dcf,       "pe": w_pe,
+                   "ev": w_ev,           "fcf_yield": w_fcf_yld, "ddm": w_ddm}
 
     st.markdown("---")
     if st.button("Analyze", type="primary", use_container_width=True):
@@ -506,6 +517,7 @@ with tab1:
     forward_eps     = fund_data.get("forward_eps")
     bvps            = fund_data.get("book_value")
     fcf             = fund_data.get("free_cash_flow")
+    ebit            = fund_data.get("ebit")
     shares          = fund_data.get("shares_outstanding")
     pe              = fund_data.get("trailing_pe")
     ebitda          = fund_data.get("ebitda")
@@ -513,23 +525,35 @@ with tab1:
     div_rate        = fund_data.get("dividend_rate")
     earnings_growth = fund_data.get("earnings_growth")
     peg             = fund_data.get("peg_ratio")
+    beta            = fund_data.get("beta") or 1.0
 
-    # ── COMPUTE FAIR VALUES ──────────────────────────────────
-    graham = graham_number(eps, bvps)
-    dcf    = dcf_valuation(fcf, dcf_growth, shares)
+    # ── COMPUTE FAIR VALUES — INSTITUTIONAL GRADE ────────────
+    # Two-stage 10yr DCF with CAPM-derived WACC (risk_free=4.5%, ERP=5.5%)
+    dcf = dcf_valuation(fcf, dcf_growth, shares, beta=beta)
 
+    # Forward P/E first, trailing fallback
     pe_val, pe_eps_label = pe_based_valuation(eps, forward_eps, sector_mults["pe"])
-    ev_val = ev_ebitda_valuation(ebitda, net_debt, shares, sector_mults["ev_ebitda"])
-    pb_val = pb_valuation(bvps, sector_mults["pb"])
 
+    # EV/EBITDA — primary institutional multiple
+    ev_val = ev_ebitda_valuation(ebitda, net_debt, shares, sector_mults["ev_ebitda"])
+
+    # EV/EBIT — more conservative, strips D&A; PE/HF standard for LBO analysis
+    ev_ebit_val = ev_ebit_valuation(ebit, net_debt, shares, sector_mults["ev_ebit"])
+
+    # FCF Yield — anchors price to required investor return threshold
+    fcf_yield_val = fcf_yield_valuation(fcf, shares,
+                                        required_fcf_yield=sector_mults["fcf_yield_req"])
+
+    # DDM — dividend-paying stocks only
     ddm_growth = 0.04
     ddm        = dividend_discount_model(div_rate, ddm_growth)
 
+    # PEG signal (informational, not a valuation method)
     peg_v, peg_sig = peg_signal(pe, earnings_growth)
 
     composite = composite_fair_value(
-        {"graham": graham, "dcf": dcf, "pe": pe_val,
-         "ev": ev_val, "pb": pb_val, "ddm": ddm},
+        {"ev_ebit": ev_ebit_val, "dcf": dcf,       "pe": pe_val,
+         "ev": ev_val,           "fcf_yield": fcf_yield_val, "ddm": ddm},
         weights
     )
     signal_text, upside_pct = fundamental_signal(current_price, composite)
@@ -592,44 +616,59 @@ with tab1:
     """, unsafe_allow_html=True)
 
     # ── FAIR VALUE METHODS ──
-    est_src = "est. (Damodaran/Bloomberg sector median)"
+    wacc_pct = round((0.045 + beta * 0.055) * 100, 1)
     st.markdown(f"### {name} Equity Fair Valuation")
+    st.markdown(
+        f'<div style="color:#64748b;font-size:0.78rem;margin-bottom:10px">'
+        f'CAPM WACC: {wacc_pct}% (β={beta:.2f} · RFR 4.5% · ERP 5.5%) — '
+        f'Sector: {sector} · Multiples: Damodaran Jan 2025</div>',
+        unsafe_allow_html=True
+    )
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        valuation_card("Safe Value (Graham)", graham, current_price,
-                       "est. (formula-based)")
+        # Two-stage DCF with CAPM WACC
+        valuation_card(
+            f"DCF — Two-Stage 10yr ({dcf_growth*100:.0f}% → 3% growth)",
+            dcf, current_price,
+            f"est. CAPM WACC {wacc_pct}% · 5yr high-growth + 5yr fade"
+        )
     with c2:
-        valuation_card(f"Future Cash Flow Value ({dcf_growth*100:.0f}% growth)", dcf, current_price,
-                       "est. (user growth rate)")
-    with c3:
-        pe_lbl = "Price to Earnings"
+        pe_lbl = "Forward P/E" if pe_eps_label == "fwd EPS" else "Price to Earnings"
         if pe_eps_label:
             pe_lbl += f" ({pe_eps_label})"
         valuation_card(pe_lbl, pe_val, current_price, sector_mults["pe_source"])
+    with c3:
+        valuation_card("EV / EBITDA", ev_val, current_price,
+                       sector_mults["ev_ebitda_source"])
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        valuation_card("Enterprise Market Value", ev_val, current_price,
-                       sector_mults["ev_ebitda_source"])
+        valuation_card("EV / Operating Earnings (EBIT)", ev_ebit_val, current_price,
+                       sector_mults["ev_ebit_source"])
     with c5:
-        valuation_card("Book Value", pb_val, current_price,
-                       sector_mults["pb_source"])
+        req_yield_pct = round(sector_mults["fcf_yield_req"] * 100, 1)
+        valuation_card(
+            f"FCF Yield ({req_yield_pct}% required return)",
+            fcf_yield_val, current_price,
+            sector_mults["fcf_yield_source"]
+        )
     with c6:
         if div_rate and div_rate > 0:
-            valuation_card("Dividends (4% growth est.)", ddm, current_price,
+            valuation_card("Dividends — DDM (4% growth)", ddm, current_price,
                            "est. (fixed 4% growth)")
         else:
             st.markdown("""
             <div class="metric-card" style="border-left:3px solid #334155">
-              <div class="metric-label">Dividends</div>
+              <div class="metric-label">Dividends (DDM)</div>
               <div class="metric-value" style="color:#64748b">N/A</div>
               <div class="metric-sub">Not a dividend-paying stock</div>
             </div>""", unsafe_allow_html=True)
 
     st.markdown("""
     <div style="color:#64748b;font-size:0.75rem;margin-bottom:12px">
-      est. = industry-consensus estimate based on Damodaran / Bloomberg sector medians
+      est. = sector-consensus median · Damodaran Jan 2025 / Bloomberg aggregates ·
+      FCF Yield conservative for high-capex companies (uses trailing FCF)
     </div>""", unsafe_allow_html=True)
 
     # PEG
@@ -970,7 +1009,7 @@ Signal thresholds: BUY ≥ 70 · ACCUMULATE 60–70 · HOLD 45–60 · REDUCE 35
             metric_card("Upside to Analyst Target", us, fmt_currency(analyst_target))
         with r3c:
             us2 = f"{upside_dcf:+.2f}%" if upside_dcf is not None else "N/A"
-            metric_card("Upside to Future Cash Flow Value", us2, fmt_currency(dcf))
+            metric_card("Upside to DCF (Two-Stage)", us2, fmt_currency(dcf))
         with r4c:
             rr       = f"{rr_ratio:.2f}x" if rr_ratio is not None else "N/A"
             rr_color = "#22c55e" if (rr_ratio and rr_ratio >= 2) else ("#ef4444" if (rr_ratio and rr_ratio < 1) else "#eab308")
@@ -1030,39 +1069,47 @@ with tab4:
 
     # ── VALUATION ──
     st.markdown("### Equity Fair Valuation Methods")
-    gloss("Safe Value (Graham Number)",
-          "Intrinsic value formula by Benjamin Graham: square root of (22.5 × EPS × Book Value Per Share). "
-          "Combines earnings and assets into a single conservative price target. "
-          "Best suited for value stocks; systematically shows growth stocks as overvalued because it ignores future growth. "
-          "Given zero weight in the Aggressive preset.")
-    gloss("Future Cash Flow Value (DCF — Discounted Cash Flow)",
-          "Projects a company's Free Cash Flow over 5 years at the chosen growth rate, then discounts future cash flows "
-          "back to today using a 10% discount rate. Adds a terminal value at 3% perpetual growth. "
-          "Divides total by shares outstanding to get per-share intrinsic value. "
-          "Most sensitive to the growth rate assumption — a higher rate gives a higher fair value. "
-          "Aggressive preset uses 20% growth; Conservative uses 8%.")
-    gloss("Price to Earnings",
-          "EPS × Sector Benchmark P/E Multiple. Uses the sector's median P/E (industry consensus estimate) "
-          "instead of the stock's own P/E — using the stock's own P/E would always produce the current price (circular math). "
-          "Falls back to Forward EPS when trailing EPS is negative (loss-making companies). "
-          "Given 45% weight in the Aggressive preset — tends to produce higher fair values for most growth stocks.")
-    gloss("Enterprise Market Value (EV/EBITDA)",
-          "Enterprise Value divided by EBITDA is a capital-structure-neutral valuation ratio. "
-          "Here: Intrinsic EV = EBITDA × Sector Median Multiple, then subtract Net Debt and divide by shares. "
-          "Good for capital-intensive industries. Given 45% weight in the Aggressive preset — "
-          "sector multiples are generally high, especially in technology, driving a higher composite fair value.")
-    gloss("Book Value (Price-to-Book)",
-          "Book Value Per Share × Sector Median P/B Multiple. Book value is total assets minus liabilities. "
-          "Most useful for asset-heavy sectors (Financials, Real Estate). Less meaningful for intangible-heavy tech companies.")
+    gloss("DCF — Two-Stage 10yr (Discounted Cash Flow)",
+          "Projects Free Cash Flow over 10 years in two stages: Stage 1 uses the chosen growth rate for 5 years; "
+          "Stage 2 linearly fades growth from that rate down to 3% (terminal) over the next 5 years. "
+          "Discount rate is CAPM-derived: Risk-Free Rate (4.5%, US 10yr) + Beta × Equity Risk Premium (5.5%). "
+          "Terminal value added via Gordon Growth Model. Divides total PV by shares outstanding for per-share value. "
+          "10-year two-stage model captures far more value for growth compounders than a simple 5-year model. "
+          "Key input: DCF growth rate (Stage 1). Aggressive preset uses 20%; Conservative uses 8%.")
+    gloss("Forward P/E × Sector Median",
+          "Preferred EPS × Sector Benchmark P/E. Uses forward EPS (analyst consensus 12-month estimate) first — "
+          "institutional analysts price on forward, not trailing, earnings. Falls back to trailing EPS if "
+          "forward is unavailable. Uses the sector's median P/E, not the stock's own P/E "
+          "(which would always reproduce the current price — circular math). "
+          "Source: Damodaran Jan 2025 sector tables.")
+    gloss("EV / EBITDA",
+          "Enterprise Value ÷ EBITDA is the primary institutional multiple. Capital-structure neutral — "
+          "unaffected by financing decisions. Formula: Fair EV = EBITDA × Sector Median, then subtract Net Debt "
+          "and divide by shares. EBITDA adds back D&A, so it's higher than EBIT — giving a higher EV. "
+          "Preferred by investment bankers and PE for acquisitions and cross-sector comparisons.")
+    gloss("EV / Operating Earnings (EV/EBIT)",
+          "More conservative than EV/EBITDA — EBIT (operating income) does NOT add back depreciation & amortisation. "
+          "This penalises capital-intensive businesses (heavy machinery, data centres) relative to asset-light ones. "
+          "Used by PE firms for LBO analysis and sell-side for cross-sector comparisons where D&A profiles differ. "
+          "Formula: Fair EV = EBIT × Sector Median, subtract Net Debt, divide by shares. "
+          "Typically gives a lower fair value than EV/EBITDA for the same company.")
+    gloss("FCF Yield (Required Return Method)",
+          "Anchors the stock's fair value to the return equity investors require. "
+          "Formula: Fair Price = FCF per Share ÷ Required FCF Yield. "
+          "Required yield = risk-free rate + equity risk premium for the asset class "
+          "(3–3.5% for high-growth tech; 4.5–5% for balanced; 5.5–6% for value/income). "
+          "This is conservative for high-capex companies (Amazon, Intel) because trailing FCF is suppressed by "
+          "growth investment. Balance it against EV/EBITDA and DCF for a complete picture. "
+          "Sector-specific required yields sourced from Damodaran Jan 2025.")
     gloss("Dividends (DDM — Gordon Growth Model)",
-          "Intrinsic Value = Dividend Per Share / (Discount Rate − Dividend Growth Rate). "
+          "Intrinsic Value = Dividend Per Share ÷ (Discount Rate − Dividend Growth Rate). "
           "Uses a fixed 4% annual dividend growth rate. Applies only to dividend-paying stocks. "
           "N/A for non-dividend payers. Given 5% weight in the Conservative preset only.")
     gloss("Composite Fair Value",
-          "Weighted average of all applicable valuation methods. Methods returning N/A are excluded and "
-          "remaining weights are auto-normalised to 100%. "
-          "Aggressive preset (PE 45% + Enterprise Market Value 45% + DCF 10%) gives the highest composite. "
-          "Conservative preset (Safe Value 20% + DCF 35% + PE 20% + Enterprise Market Value 15% + Book Value 5% + Dividends 5%) gives the lowest.")
+          "Weighted average of all applicable valuation methods. Methods returning N/A (missing data) are excluded "
+          "and remaining weights are auto-normalised to 100% so the composite always uses all available data. "
+          "Aggressive preset (EV/EBITDA 40% + Forward P/E 35% + DCF 25%) gives the highest composite. "
+          "Conservative preset (DCF 35% + EV/EBIT 25% + P/E 20% + FCF Yield 15% + DDM 5%) gives the lowest.")
     gloss("Upside / Downside %",
           "(Composite Fair Value − Current Price) / Current Price × 100. "
           "Positive = stock trading below intrinsic value (upside potential). "
@@ -1072,19 +1119,18 @@ with tab4:
     # ── RISK APPETITE ──
     st.markdown("### Risk Appetite Presets")
     gloss("Aggressive",
-          "PE 45% + Enterprise Market Value 45% + Future Cash Flow Value 10% at 20% DCF growth rate. "
-          "Designed to give the highest composite fair value. Market-based sector multiples dominate. "
-          "Best for high-growth, pre-dividend technology or consumer companies. "
-          "Safe Value, Book Value, and Dividends have 0% weight.")
+          "EV/EBITDA 40% + Forward P/E 35% + Two-Stage DCF 25% at 20% Stage 1 growth. "
+          "Designed to give the highest composite fair value. Sector EBITDA multiples and "
+          "forward earnings dominate. Best for high-growth, pre-dividend tech and platform companies. "
+          "EV/EBIT and FCF Yield excluded — they unfairly penalise high-capex growth businesses.")
     gloss("Moderate",
-          "Future Cash Flow Value 40% + Price to Earnings 25% + Enterprise Market Value 20% + "
-          "Safe Value 10% + Book Value 5%. DCF growth rate of 12%. "
-          "Balanced between cash-flow fundamentals and market multiples.")
+          "EV/EBITDA 35% + Two-Stage DCF 30% + Forward P/E 20% + FCF Yield 15%. DCF growth 12%. "
+          "Reflects a typical sell-side analyst blended approach — EBITDA multiples anchor, "
+          "DCF provides cash-flow discipline, FCF Yield adds a return-threshold reality check.")
     gloss("Conservative",
-          "Safe Value 20% + Future Cash Flow Value 35% + Price to Earnings 20% + "
-          "Enterprise Market Value 15% + Book Value 5% + Dividends 5%. DCF growth rate of 8%. "
-          "All six methods active. Designed to give the lowest composite fair value — "
-          "emphasises capital preservation over upside capture.")
+          "Two-Stage DCF 35% + EV/EBIT 25% + P/E 20% + FCF Yield 15% + Dividends (DDM) 5%. DCF growth 8%. "
+          "EV/EBIT and FCF Yield are the most conservative anchors — they strip D&A and demand a "
+          "return threshold respectively. Designed for capital-preservation-first investors.")
 
     # ── RATIOS ──
     st.markdown("### Key Financial Ratios")

@@ -22,10 +22,21 @@ def graham_number(eps, book_value_per_share):
 
 
 def dcf_valuation(free_cash_flow, growth_rate, shares_outstanding,
-                  discount_rate=0.10, terminal_growth=0.03, years=5):
+                  beta=1.0, risk_free_rate=0.045, equity_risk_premium=0.055,
+                  high_growth_years=5, fade_years=5, terminal_growth=0.03):
     """
-    5-year DCF with terminal value.
-    Returns per-share intrinsic value.
+    Two-stage DCF with CAPM-derived discount rate. Institutional grade.
+
+    Stage 1: 'growth_rate' applied for high_growth_years.
+    Stage 2: Growth linearly fades from growth_rate → terminal_growth over fade_years.
+    Terminal value: Gordon Growth Model on the final projected FCF.
+
+    Discount rate = risk_free_rate + beta × equity_risk_premium (CAPM).
+    Default inputs reflect 2024/2025 US market: 10yr UST 4.5%, ERP 5.5%.
+    A beta of 1.0 → WACC ≈ 10%; beta 1.3 (e.g. AMZN) → WACC ≈ 11.65%.
+
+    10-year horizon gives a far more realistic terminal value capture than
+    a 5-year model for compounding growth businesses.
     """
     try:
         if free_cash_flow is None or shares_outstanding is None:
@@ -33,18 +44,30 @@ def dcf_valuation(free_cash_flow, growth_rate, shares_outstanding,
         if free_cash_flow <= 0 or shares_outstanding <= 0:
             return None
         if growth_rate is None:
-            growth_rate = 0.08
-        if discount_rate <= terminal_growth:
-            return None
+            growth_rate = 0.10
 
+        # CAPM discount rate — min 3% above terminal growth to avoid division issues
+        discount_rate = risk_free_rate + (beta or 1.0) * equity_risk_premium
+        discount_rate = max(discount_rate, terminal_growth + 0.03)
+
+        total_years = high_growth_years + fade_years
         pv = 0.0
-        for i in range(1, years + 1):
-            fcf_i = free_cash_flow * (1 + growth_rate) ** i
-            pv += fcf_i / (1 + discount_rate) ** i
+        fcf_current = free_cash_flow
 
-        terminal_fcf = free_cash_flow * (1 + growth_rate) ** years * (1 + terminal_growth)
-        terminal_value = terminal_fcf / (discount_rate - terminal_growth)
-        pv_terminal = terminal_value / (1 + discount_rate) ** years
+        for i in range(1, total_years + 1):
+            if i <= high_growth_years:
+                g = growth_rate
+            else:
+                # Linear fade: t=1 → still near growth_rate, t=fade_years → terminal_growth
+                t = i - high_growth_years
+                g = growth_rate - (growth_rate - terminal_growth) * (t / fade_years)
+
+            fcf_current = fcf_current * (1 + g)
+            pv += fcf_current / (1 + discount_rate) ** i
+
+        # Terminal value on the last projected FCF
+        terminal_value = fcf_current * (1 + terminal_growth) / (discount_rate - terminal_growth)
+        pv_terminal = terminal_value / (1 + discount_rate) ** total_years
 
         intrinsic_value = (pv + pv_terminal) / shares_outstanding
         return round(intrinsic_value, 2)
@@ -56,23 +79,71 @@ def pe_based_valuation(eps, forward_eps, sector_pe):
     """
     EPS × sector benchmark P/E.
 
-    Uses trailing EPS first; falls back to forward EPS for growth / loss-making companies.
-    sector_pe should come from live sector ETF data (see data.fetch_sector_multiples)
-    or industry-consensus fallback (labeled accordingly in the UI).
+    Institutional preference: Forward EPS first (analyst consensus is forward-looking),
+    then trailing EPS. Sector P/E from Damodaran/Bloomberg sector median.
+    Using the stock's own P/E would always reproduce the current price (circular math).
 
     Returns: (value_or_None, eps_label_or_None)
     """
     try:
-        # Prefer trailing EPS (actual earnings)
-        if eps is not None and eps > 0:
-            return round(eps * sector_pe, 2), "trailing EPS"
-        # Fall back to forward EPS (analyst estimates) for growth / pre-profit companies
+        # Prefer forward EPS — analysts price on forward earnings, not trailing
         if forward_eps is not None and forward_eps > 0:
             return round(forward_eps * sector_pe, 2), "fwd EPS"
+        # Fall back to trailing EPS
+        if eps is not None and eps > 0:
+            return round(eps * sector_pe, 2), "trailing EPS"
         # Negative / unavailable EPS — PE-based valuation doesn't apply
         return None, None
     except Exception:
         return None, None
+
+
+def ev_ebit_valuation(ebit, net_debt, shares_outstanding, ev_ebit_multiple):
+    """
+    EV/EBIT-based valuation — preferred institutional complement to EV/EBITDA.
+
+    EV/EBIT strips out D&A, making it more conservative than EV/EBITDA and better
+    for comparing capital-intensive vs asset-light companies on equal footing.
+    Used heavily by PE firms and sell-side for LBO and cross-sector comparisons.
+
+    Formula: Fair Price = (EBIT × multiple − Net Debt) / Shares Outstanding
+    """
+    try:
+        if ebit is None or ebit <= 0 or shares_outstanding is None or shares_outstanding <= 0:
+            return None
+        enterprise_value = ebit * ev_ebit_multiple
+        net_debt = net_debt or 0
+        equity_value = enterprise_value - net_debt
+        return round(max(equity_value / shares_outstanding, 0), 2)
+    except Exception:
+        return None
+
+
+def fcf_yield_valuation(free_cash_flow, shares_outstanding, required_fcf_yield=0.04):
+    """
+    FCF Yield-based intrinsic value — anchors equity value to required investor return.
+
+    Institutional logic: Fair Price = FCF per share / Required FCF Yield.
+    Required yield = risk-free rate + equity risk premium for this asset class.
+    - Growth (3–4%): accept low FCF yield for high future growth (tech, cloud)
+    - Balanced (4–5%): mid-quality compounder
+    - Conservative (5–6%): mature / value-oriented; demands higher yield
+
+    Limitation: uses trailing FCF. High-capex companies (Amazon AWS, Intel fabs)
+    have suppressed trailing FCF. This conservatively understates their earnings power.
+    Balance against EV/EBITDA and DCF methods for a full picture.
+    """
+    try:
+        if free_cash_flow is None or shares_outstanding is None:
+            return None
+        if free_cash_flow <= 0 or shares_outstanding <= 0:
+            return None
+        if required_fcf_yield <= 0:
+            return None
+        fcf_per_share = free_cash_flow / shares_outstanding
+        return round(fcf_per_share / required_fcf_yield, 2)
+    except Exception:
+        return None
 
 
 def ev_ebitda_valuation(ebitda, net_debt, shares_outstanding, ev_multiple):

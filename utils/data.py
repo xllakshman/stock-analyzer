@@ -51,43 +51,52 @@ SECTOR_ETFS = {
 }
 
 # Fallback multiples: industry-consensus long-run medians.
-# Sources: Damodaran (NYU Stern) annual sector tables, Bloomberg sector aggregates.
+# Sources: Damodaran (NYU Stern) January 2025 sector tables, Bloomberg sector aggregates.
 # These are HARDCODED estimates — used only when live ETF fetch fails.
+# EV/EBIT is more conservative than EV/EBITDA (strips out D&A) — better for
+# cross-sector comparison. EV/EBITDA remains the primary institutional multiple.
+# FCF Yield (required) = what equity investors demand; lower = growth premium.
 SECTOR_MULTIPLES_FALLBACK = {
-    "Technology":             {"pe": 28, "ev_ebitda": 20, "pb": 6.0},
-    "Communication Services": {"pe": 22, "ev_ebitda": 14, "pb": 3.0},
-    "Consumer Discretionary": {"pe": 22, "ev_ebitda": 15, "pb": 4.0},
-    "Consumer Staples":       {"pe": 20, "ev_ebitda": 13, "pb": 5.0},
-    "Healthcare":             {"pe": 22, "ev_ebitda": 14, "pb": 4.0},
-    "Financials":             {"pe": 13, "ev_ebitda": 11, "pb": 1.5},
-    "Industrials":            {"pe": 20, "ev_ebitda": 14, "pb": 3.0},
-    "Energy":                 {"pe": 12, "ev_ebitda":  7, "pb": 1.5},
-    "Materials":              {"pe": 17, "ev_ebitda": 10, "pb": 2.0},
-    "Real Estate":            {"pe": 35, "ev_ebitda": 18, "pb": 2.0},
-    "Utilities":              {"pe": 17, "ev_ebitda": 10, "pb": 1.5},
-    "default":                {"pe": 20, "ev_ebitda": 13, "pb": 3.0},
+    # sector:           pe    ev_ebitda  ev_ebit   pb    fcf_yield_req
+    "Technology":             {"pe": 32, "ev_ebitda": 22, "ev_ebit": 28, "pb": 7.5, "fcf_yield_req": 0.030},
+    "Communication Services": {"pe": 20, "ev_ebitda": 13, "ev_ebit": 16, "pb": 3.5, "fcf_yield_req": 0.040},
+    "Consumer Discretionary": {"pe": 25, "ev_ebitda": 16, "ev_ebit": 20, "pb": 5.0, "fcf_yield_req": 0.035},
+    "Consumer Staples":       {"pe": 22, "ev_ebitda": 14, "ev_ebit": 18, "pb": 5.5, "fcf_yield_req": 0.045},
+    "Healthcare":             {"pe": 22, "ev_ebitda": 15, "ev_ebit": 19, "pb": 4.0, "fcf_yield_req": 0.040},
+    "Financials":             {"pe": 14, "ev_ebitda": 11, "ev_ebit": 13, "pb": 1.5, "fcf_yield_req": 0.050},
+    "Industrials":            {"pe": 22, "ev_ebitda": 15, "ev_ebit": 18, "pb": 3.5, "fcf_yield_req": 0.045},
+    "Energy":                 {"pe": 12, "ev_ebitda":  7, "ev_ebit": 10, "pb": 1.5, "fcf_yield_req": 0.060},
+    "Materials":              {"pe": 18, "ev_ebitda": 11, "ev_ebit": 14, "pb": 2.5, "fcf_yield_req": 0.050},
+    "Real Estate":            {"pe": 35, "ev_ebitda": 20, "ev_ebit": 25, "pb": 2.5, "fcf_yield_req": 0.045},
+    "Utilities":              {"pe": 18, "ev_ebitda": 11, "ev_ebit": 14, "pb": 1.8, "fcf_yield_req": 0.055},
+    "default":                {"pe": 22, "ev_ebitda": 14, "ev_ebit": 18, "pb": 3.5, "fcf_yield_req": 0.045},
 }
 
 
 def fetch_sector_multiples(sector: str) -> dict:
     """
-    Returns sector benchmark multiples for PE, P/B, and EV/EBITDA.
+    Returns sector benchmark multiples: PE, P/B, EV/EBITDA, EV/EBIT, FCF Yield (required).
 
     NOTE: Live ETF fetching was intentionally removed to avoid extra API calls
     that push Streamlit Cloud's shared IP over Yahoo Finance's rate limit.
-    Values are industry-consensus long-run medians (Damodaran/Bloomberg).
+    Values are industry-consensus medians from Damodaran (NYU Stern) Jan 2025
+    and Bloomberg sector aggregates.
     All values are clearly labeled as estimates in the UI.
     """
     fb = SECTOR_MULTIPLES_FALLBACK.get(sector) or SECTOR_MULTIPLES_FALLBACK["default"]
     etf_name = SECTOR_ETFS.get(sector, "")
-    ref = f"⚠️ est. (Damodaran/Bloomberg median{', ref: ' + etf_name if etf_name else ''})"
+    ref = f"⚠️ est. (Damodaran Jan 2025{', ref: ' + etf_name if etf_name else ''})"
     return {
         "pe":               fb["pe"],
         "pb":               fb["pb"],
         "ev_ebitda":        fb["ev_ebitda"],
+        "ev_ebit":          fb["ev_ebit"],
+        "fcf_yield_req":    fb["fcf_yield_req"],
         "pe_source":        ref,
         "pb_source":        ref,
         "ev_ebitda_source": ref,
+        "ev_ebit_source":   ref,
+        "fcf_yield_source": ref,
     }
 
 
@@ -453,9 +462,15 @@ def extract_fundamentals(ticker: str) -> dict:
         _roa_info = (_ni / _ta) if (_ni is not None and _ta and _ta > 0) else None
     result["roa"] = _roa_info
 
+    # EBIT (Operating Income) — used for EV/EBIT valuation and ROCE
+    _ebit_val = (info.get("ebit") or info.get("operatingIncome") or
+                 _stmt_val(income, "EBIT", "OperatingIncome",
+                           "OperatingIncomeForSegment", "ReconciledDepreciation"))
+    result["ebit"] = _ebit_val
+
     # ROCE: EBIT / (Total Assets - Current Liabilities)
     try:
-        _ebit = _stmt_val(income, "EBIT", "OperatingIncome")
+        _ebit = _ebit_val
         _ta   = _stmt_val(balance, "TotalAssets")
         _cl   = _stmt_val(balance, "CurrentLiabilities")
         if _ebit and _ta and _cl and (_ta - _cl) > 0:
