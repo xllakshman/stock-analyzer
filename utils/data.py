@@ -187,87 +187,86 @@ def _merge_fast_info(info: dict, t: yf.Ticker) -> dict:
     return info
 
 
+def _fetch_statements(t: yf.Ticker) -> tuple:
+    """
+    Fetch income statement, cash flow, and balance sheet independently.
+    Uses query2.finance.yahoo.com/ws/fundamentals-timeseries — a different
+    endpoint from quoteSummary, so it can succeed even when .info is rate-limited.
+    Returns (income_df, cashflow_df, balance_df) — any may be empty on failure.
+    """
+    income = cashflow = balance = pd.DataFrame()
+    try:
+        income = t.income_stmt
+    except Exception:
+        pass
+    try:
+        cashflow = t.cashflow
+    except Exception:
+        pass
+    try:
+        balance = t.balance_sheet
+    except Exception:
+        pass
+    return income, cashflow, balance
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financials(ticker: str) -> dict:
     """
-    Fetch fundamental data with retry + rate-limit detection.
+    Fetch fundamental data with two independent paths:
 
-    yfinance 1.x handles cookie/crumb auth and Chrome impersonation via curl_cffi.
-    Key changes vs 0.2.x:
-      - Price/marketCap/52wk fields moved to fast_info; injected back via _merge_fast_info.
-      - MIN_INFO_KEYS lowered to 10: rate-limited response returns 0-5 keys;
-        a real (even partial) response returns 10+.
+    PATH A — .info (quoteSummary via query1): company metadata, P/E, EPS,
+      margins, analyst targets, etc. Prone to rate-limiting on shared IPs.
+
+    PATH B — financial statements (fundamentals-timeseries via query2):
+      income stmt, cash flow, balance sheet. Different endpoint — more
+      rate-limit resistant. Fetched independently so it succeeds even when
+      PATH A fails.
+
+    Both paths are attempted; extract_fundamentals() derives missing fields
+    from statements when .info fields are None.
     """
-    MIN_INFO_KEYS = 10   # rate-limited responses return 0-5 keys; real ones return 10+
-    last_error = "unknown"
+    MIN_INFO_KEYS = 10   # rate-limited response has 0-5 keys; real one has 10+
 
+    t = _ticker(ticker)
+
+    # ── PATH A: .info (retry up to 3 times) ─────────────────────
+    info = {}
     for attempt in range(3):
         try:
             if attempt > 0:
-                _backoff_sleep(attempt)   # 3s, 8s, 15s + jitter
+                _backoff_sleep(attempt)
+            raw = t.info or {}
+            if len(raw) >= MIN_INFO_KEYS:
+                info = raw
+                break
+        except (YFRateLimitError, YFDataException):
+            pass
+        except Exception:
+            pass
 
-            t    = _ticker(ticker)
-            info = t.info or {}
+    # Always inject retired price/market fields from fast_info
+    info = _merge_fast_info(info, t)
 
-            if len(info) < MIN_INFO_KEYS:
-                last_error = f"sparse_response (got {len(info)} keys)"
-                continue   # retry
+    # ── PATH B: financial statements (independent endpoint) ──────
+    income, cashflow, balance = _fetch_statements(t)
 
-            # Inject retired price/market fields from fast_info back into info
-            info = _merge_fast_info(info, t)
+    # If BOTH paths returned nothing useful, signal that to the caller
+    has_info  = len(info) >= MIN_INFO_KEYS
+    has_stmts = not income.empty or not cashflow.empty or not balance.empty
+    has_price = bool(info.get("currentPrice") or info.get("regularMarketPrice"))
 
-            try:
-                income = t.income_stmt
-            except Exception:
-                income = pd.DataFrame()
+    if not has_price:
+        # Complete failure — nothing usable
+        return {"error": "no_data", "rate_limited": True}
 
-            try:
-                cashflow = t.cashflow
-            except Exception:
-                cashflow = pd.DataFrame()
-
-            try:
-                balance = t.balance_sheet
-            except Exception:
-                balance = pd.DataFrame()
-
-            return {
-                "info":     info,
-                "income":   income,
-                "cashflow": cashflow,
-                "balance":  balance,
-            }
-
-        except (YFRateLimitError, YFDataException) as e:
-            last_error = f"yf_error: {type(e).__name__}"
-        except Exception as e:
-            last_error = str(e)[:80]
-
-    # All retries failed — try fast_info to recover at least price data
-    try:
-        t  = _ticker(ticker)
-        fi = t.fast_info
-        partial_info = {
-            "currentPrice":     fi.get("lastPrice"),
-            "regularMarketPrice": fi.get("lastPrice"),
-            "previousClose":    fi.get("previousClose"),
-            "marketCap":        fi.get("marketCap"),
-            "fiftyTwoWeekHigh": fi.get("yearHigh"),
-            "fiftyTwoWeekLow":  fi.get("yearLow"),
-            "sharesOutstanding": fi.get("shares"),
-            "_partial":         True,
-        }
-        return {
-            "info":        partial_info,
-            "income":      pd.DataFrame(),
-            "cashflow":    pd.DataFrame(),
-            "balance":     pd.DataFrame(),
-            "rate_limited": True,
-        }
-    except Exception:
-        pass
-
-    return {"error": last_error, "rate_limited": True}
+    return {
+        "info":         info,
+        "income":       income,
+        "cashflow":     cashflow,
+        "balance":      balance,
+        "rate_limited": not has_info,   # True when only partial .info was available
+    }
 
 
 def safe_get(d: dict, *keys, default=None):
@@ -312,113 +311,182 @@ def extract_fundamentals(ticker: str) -> dict:
     result["fifty_two_week_high"] = info.get("fiftyTwoWeekHigh")
     result["fifty_two_week_low"]  = info.get("fiftyTwoWeekLow")
 
-    # Valuation inputs
-    result["eps"] = info.get("trailingEps")
-    result["forward_eps"] = info.get("forwardEps")
-    result["book_value"] = info.get("bookValue")
-    result["trailing_pe"] = info.get("trailingPE")
-    result["forward_pe"] = info.get("forwardPE")
-    result["pb_ratio"] = info.get("priceToBook")
-    result["peg_ratio"] = info.get("pegRatio")
-    result["ev"] = info.get("enterpriseValue")
-    result["ebitda"] = info.get("ebitda")
+    # ── Helper: safe row lookup from a statement DataFrame ───────
+    def _stmt_val(df: pd.DataFrame, *row_names) -> float | None:
+        """Return most-recent value of the first matching row in a statement df."""
+        if df is None or df.empty:
+            return None
+        for name in row_names:
+            if name in df.index:
+                try:
+                    col = df.loc[name].dropna()
+                    return float(col.iloc[0]) if len(col) > 0 else None
+                except Exception:
+                    pass
+        return None
 
-    # FCF
-    fcf = info.get("freeCashflow")
-    if fcf is None and not cashflow.empty:
-        try:
-            op_cf = cashflow.loc["Operating Cash Flow"].iloc[0] if "Operating Cash Flow" in cashflow.index else None
-            capex_row = None
-            for label in ["Capital Expenditure", "Capital Expenditures", "Purchase Of PPE"]:
-                if label in cashflow.index:
-                    capex_row = cashflow.loc[label].iloc[0]
-                    break
-            capex = capex_row if capex_row is not None else 0
-            if op_cf is not None:
-                fcf = op_cf - abs(capex)
-        except Exception:
-            fcf = None
-    result["free_cash_flow"] = fcf
+    # ── Valuation inputs — prefer .info, fall back to statements ─
+    # EPS: yfinance 1.x uses camelCase keys in income_stmt
+    _eps_info = info.get("trailingEps")
+    _eps_stmt = _stmt_val(income, "DilutedEPS", "BasicEPS",
+                          "NormalizedDilutedEPS", "NormalizedBasicEPS")
+    result["eps"] = _eps_info if _eps_info is not None else _eps_stmt
+
+    result["forward_eps"] = info.get("forwardEps")
+
+    # Shares — needed to compute book value per share
+    _shares = (result["shares_outstanding"] or
+               _stmt_val(income, "DilutedAverageShares", "BasicAverageShares") or
+               _stmt_val(balance, "OrdinarySharesNumber", "ShareIssued"))
+    result["shares_outstanding"] = _shares
+
+    # Book Value Per Share: prefer .info; else CommonStockEquity / shares
+    _bv_info = info.get("bookValue")
+    if _bv_info is None and _shares and _shares > 0:
+        _equity = _stmt_val(balance, "CommonStockEquity", "StockholdersEquity",
+                            "TotalEquityGrossMinorityInterest")
+        _bv_info = (_equity / _shares) if _equity else None
+    result["book_value"] = _bv_info
+
+    result["trailing_pe"] = info.get("trailingPE")
+    result["forward_pe"]  = info.get("forwardPE")
+    result["pb_ratio"]    = info.get("priceToBook")
+    result["peg_ratio"]   = info.get("pegRatio")
+
+    # EV — hard to compute without .info; use what we have
+    result["ev"] = info.get("enterpriseValue")
+    # If .info has no EV but we have debt/cash from balance sheet, estimate it
+    if result["ev"] is None and result["market_cap"]:
+        _total_debt  = _stmt_val(balance, "TotalDebt", "LongTermDebt") or 0
+        _cash        = _stmt_val(balance, "CashCashEquivalentsAndShortTermInvestments",
+                                 "CashAndCashEquivalents") or 0
+        result["ev"] = result["market_cap"] + _total_debt - _cash
+
+    # EBITDA — yfinance income_stmt has "EBITDA" row directly
+    _ebitda_info = info.get("ebitda")
+    _ebitda_stmt = _stmt_val(income, "EBITDA", "NormalizedEBITDA")
+    result["ebitda"] = _ebitda_info if _ebitda_info is not None else _ebitda_stmt
+
+    # FCF — cashflow stmt has "FreeCashFlow" row directly
+    _fcf_info = info.get("freeCashflow")
+    _fcf_stmt = _stmt_val(cashflow, "FreeCashFlow")
+    if _fcf_stmt is None:
+        # Compute: Operating CF - CapEx
+        _ocf   = _stmt_val(cashflow, "OperatingCashFlow", "CashFlowFromContinuingOperatingActivities")
+        _capex = _stmt_val(cashflow, "CapitalExpenditure", "PurchaseOfPPE", "CapitalExpenditureReported")
+        _fcf_stmt = (_ocf - abs(_capex)) if (_ocf is not None and _capex is not None) else _ocf
+    result["free_cash_flow"] = _fcf_info if _fcf_info is not None else _fcf_stmt
+
+    # Total Revenue — for margin computation fallback
+    _total_revenue = (info.get("totalRevenue") or
+                      _stmt_val(income, "TotalRevenue", "OperatingRevenue"))
 
     # Growth rates
-    result["revenue_growth"] = info.get("revenueGrowth")
+    result["revenue_growth"]  = info.get("revenueGrowth")
     result["earnings_growth"] = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")
 
     # Revenue history for CAGR
     try:
         if not income.empty:
-            rev_rows = [r for r in ["Total Revenue", "Revenue"] if r in income.index]
+            rev_rows = [r for r in ["TotalRevenue", "Total Revenue", "OperatingRevenue"] if r in income.index]
             if rev_rows:
                 rev = income.loc[rev_rows[0]].dropna()
-                if len(rev) >= 4:
+                if len(rev) >= 2:
                     rev_sorted = rev.sort_index()
-                    result["revenue_3yr_cagr"] = (
-                        (rev_sorted.iloc[-1] / rev_sorted.iloc[-4]) ** (1/3) - 1
-                        if rev_sorted.iloc[-4] > 0 else None
-                    )
-                    result["revenue_yoy"] = (
-                        (rev_sorted.iloc[-1] / rev_sorted.iloc[-2]) - 1
-                        if len(rev_sorted) >= 2 and rev_sorted.iloc[-2] > 0 else None
-                    )
+                    if len(rev_sorted) >= 4 and rev_sorted.iloc[-4] > 0:
+                        result["revenue_3yr_cagr"] = (
+                            (rev_sorted.iloc[-1] / rev_sorted.iloc[-4]) ** (1/3) - 1
+                        )
+                    if rev_sorted.iloc[-2] > 0:
+                        result["revenue_yoy"] = (rev_sorted.iloc[-1] / rev_sorted.iloc[-2]) - 1
+                    # Also fill revenue_growth if .info didn't provide it
+                    if result["revenue_growth"] is None and "revenue_yoy" in result:
+                        result["revenue_growth"] = result.get("revenue_yoy")
     except Exception:
         pass
 
     # Earnings CAGR
     try:
         if not income.empty:
-            ni_rows = [r for r in ["Net Income", "Net Income Common Stockholders"] if r in income.index]
+            ni_rows = [r for r in ["NetIncome", "Net Income", "NetIncomeCommonStockholders",
+                                   "NetIncomeFromContinuingOperationNetMinorityInterest"] if r in income.index]
             if ni_rows:
                 ni = income.loc[ni_rows[0]].dropna()
                 if len(ni) >= 4:
                     ni_sorted = ni.sort_index()
-                    result["earnings_3yr_cagr"] = (
-                        (ni_sorted.iloc[-1] / ni_sorted.iloc[-4]) ** (1/3) - 1
-                        if ni_sorted.iloc[-4] > 0 else None
-                    )
+                    if ni_sorted.iloc[-4] > 0:
+                        result["earnings_3yr_cagr"] = (
+                            (ni_sorted.iloc[-1] / ni_sorted.iloc[-4]) ** (1/3) - 1
+                        )
     except Exception:
         pass
 
     # Margins and returns
-    result["profit_margin"] = info.get("profitMargins")
+    _profit_margin_info = info.get("profitMargins")
+    if _profit_margin_info is None and _total_revenue and _total_revenue > 0:
+        _net_income = _stmt_val(income, "NetIncome", "NetIncomeCommonStockholders",
+                                "NetIncomeFromContinuingOperationNetMinorityInterest")
+        _profit_margin_info = (_net_income / _total_revenue) if _net_income is not None else None
+    result["profit_margin"] = _profit_margin_info
+    # EBITDA margin — use statement EBITDA + revenue as fallback
+    _ebitda_for_margin = result["ebitda"]
+    _rev_for_margin    = _total_revenue
     result["ebitda_margin"] = (
-        info.get("ebitda") / info.get("totalRevenue")
-        if info.get("ebitda") and info.get("totalRevenue") else None
+        _ebitda_for_margin / _rev_for_margin
+        if _ebitda_for_margin and _rev_for_margin and _rev_for_margin > 0 else None
     )
-    result["roe"] = info.get("returnOnEquity")
-    result["roa"] = info.get("returnOnAssets")
 
-    # ROCE approximation: EBIT / (Total Assets - Current Liabilities)
+    # ROE / ROA — prefer .info; else compute from statements
+    _roe_info = info.get("returnOnEquity")
+    if _roe_info is None:
+        _ni     = _stmt_val(income, "NetIncome", "NetIncomeCommonStockholders",
+                            "NetIncomeFromContinuingOperationNetMinorityInterest")
+        _equity = _stmt_val(balance, "CommonStockEquity", "StockholdersEquity")
+        _roe_info = (_ni / _equity) if (_ni is not None and _equity and _equity > 0) else None
+    result["roe"] = _roe_info
+
+    _roa_info = info.get("returnOnAssets")
+    if _roa_info is None:
+        _ni = _stmt_val(income, "NetIncome", "NetIncomeCommonStockholders",
+                        "NetIncomeFromContinuingOperationNetMinorityInterest")
+        _ta = _stmt_val(balance, "TotalAssets")
+        _roa_info = (_ni / _ta) if (_ni is not None and _ta and _ta > 0) else None
+    result["roa"] = _roa_info
+
+    # ROCE: EBIT / (Total Assets - Current Liabilities)
     try:
-        if not income.empty and not balance.empty:
-            ebit_rows = [r for r in ["EBIT", "Operating Income"] if r in income.index]
-            ebit = income.loc[ebit_rows[0]].iloc[0] if ebit_rows else None
-            ta = balance.loc["Total Assets"].iloc[0] if "Total Assets" in balance.index else None
-            cl_rows = [r for r in ["Current Liabilities", "Total Current Liabilities"] if r in balance.index]
-            cl = balance.loc[cl_rows[0]].iloc[0] if cl_rows else None
-            if ebit and ta and cl:
-                result["roce"] = ebit / (ta - cl) if (ta - cl) > 0 else None
+        _ebit = _stmt_val(income, "EBIT", "OperatingIncome")
+        _ta   = _stmt_val(balance, "TotalAssets")
+        _cl   = _stmt_val(balance, "CurrentLiabilities")
+        if _ebit and _ta and _cl and (_ta - _cl) > 0:
+            result["roce"] = _ebit / (_ta - _cl)
+        else:
+            result["roce"] = None
     except Exception:
         result["roce"] = None
 
-    # Leverage — yfinance returns debtToEquity as a percentage (e.g. 150 = 1.5x D/E)
-    # Guard: if the value is already in decimal form (< 20) assume it was pre-normalized
+    # Leverage
     _de = info.get("debtToEquity")
     if _de is not None:
+        # yfinance returns D/E as % (e.g. 150 = 1.5x); guard against pre-normalized decimals
         result["debt_equity"] = _de / 100 if _de > 20 else _de
     else:
-        result["debt_equity"] = None
+        # Derive from balance sheet: TotalDebt / CommonStockEquity
+        _td     = _stmt_val(balance, "TotalDebt", "LongTermDebt")
+        _equity = _stmt_val(balance, "CommonStockEquity", "StockholdersEquity")
+        result["debt_equity"] = (_td / _equity) if (_td is not None and _equity and _equity > 0) else None
 
     result["current_ratio"] = info.get("currentRatio")
 
     # Interest coverage
     try:
-        if not income.empty:
-            ebit_rows = [r for r in ["EBIT", "Operating Income"] if r in income.index]
-            int_rows = [r for r in ["Interest Expense", "Net Interest Income"] if r in income.index]
-            if ebit_rows and int_rows:
-                ebit = income.loc[ebit_rows[0]].iloc[0]
-                int_exp = abs(income.loc[int_rows[0]].iloc[0])
-                result["interest_coverage"] = ebit / int_exp if int_exp > 0 else None
+        _ebit    = _stmt_val(income, "EBIT", "OperatingIncome")
+        _int_exp = _stmt_val(income, "InterestExpense", "InterestExpenseNonOperating",
+                             "NetInterestIncome")
+        if _ebit and _int_exp and abs(_int_exp) > 0:
+            result["interest_coverage"] = _ebit / abs(_int_exp)
+        else:
+            result["interest_coverage"] = None
     except Exception:
         result["interest_coverage"] = None
 
@@ -427,10 +495,16 @@ def extract_fundamentals(ticker: str) -> dict:
     result["institutional_ownership"] = info.get("heldPercentInstitutions")
     result["short_pct"] = info.get("shortPercentOfFloat")
 
-    # Net debt
-    total_debt = info.get("totalDebt") or 0
-    cash = info.get("totalCash") or 0
-    result["net_debt"] = total_debt - cash
+    # Net debt — prefer .info; else compute from balance sheet
+    _total_debt_info = info.get("totalDebt")
+    _cash_info       = info.get("totalCash")
+    if _total_debt_info is not None:
+        result["net_debt"] = (_total_debt_info or 0) - (_cash_info or 0)
+    else:
+        _td   = _stmt_val(balance, "TotalDebt", "LongTermDebt") or 0
+        _cash = _stmt_val(balance, "CashCashEquivalentsAndShortTermInvestments",
+                          "CashAndCashEquivalents") or 0
+        result["net_debt"] = _td - _cash
 
     # Analyst data
     result["analyst_target"]      = info.get("targetMeanPrice")
