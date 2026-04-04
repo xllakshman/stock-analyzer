@@ -4,6 +4,7 @@ Search any US or India stock by ticker or company name.
 Run: streamlit run app.py
 """
 import streamlit as st
+import streamlit.components.v1 as st_components
 import pandas as pd
 import numpy as np
 import time
@@ -1077,8 +1078,16 @@ Measures the average daily price swing over 14 days. Higher ATR = more volatile 
                   <td style="padding:9px 10px">{row['Score']}</td>
                 </tr>"""
             table_html += "</tbody></table>"
-            # .strip() prevents leading whitespace from triggering markdown code-block rendering
-            st.markdown(table_html.strip(), unsafe_allow_html=True)
+            # Use iframe-based renderer to guarantee raw HTML — markdown parser
+            # treats 4+ leading spaces as code blocks, breaking the table.
+            iframe_html = (
+                "<style>body{background:#0f172a;margin:0;padding:0;"
+                "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}"
+                "table{border-collapse:collapse;width:100%}"
+                "b{font-weight:600}</style>"
+                + table_html.strip()
+            )
+            st_components.html(iframe_html, height=230, scrolling=False)
 
             # ── Trade Setup Summary ──
             st.markdown("### Trade Setup")
@@ -1125,6 +1134,124 @@ Measures the average daily price swing over 14 days. Higher ATR = more volatile 
                 f'Thresholds: &gt;80 High-Confidence Buy · 50–80 Speculative · &lt;50 Avoid'
                 f'</div>',
                 unsafe_allow_html=True,
+            )
+
+            # ── Signal Interpretation (plain-English narrative) ──
+            st.markdown("---")
+            st.markdown("#### 📋 Signal Interpretation")
+
+            # Momentum narrative
+            rsi_val = p_mom["rsi"]
+            if rsi_val < 35:
+                mom_text = (f"RSI at **{rsi_val}** is in oversold territory — the stock has been "
+                            f"sold aggressively and a bounce or reversal is statistically more likely. "
+                            f"Momentum score is low ({p_mom['score']}/25) because the downtrend is "
+                            f"still active, but oversold RSI can precede the next entry point.")
+            elif rsi_val < 50:
+                mom_text = (f"RSI at **{rsi_val}** is below the midline — momentum is net bearish. "
+                            f"The stock is not oversold, just weak. Buyers haven't taken control yet. "
+                            f"Score: {p_mom['score']}/25.")
+            elif rsi_val < 65:
+                mom_text = (f"RSI at **{rsi_val}** is healthy mid-range — no overbought risk, "
+                            f"momentum is constructive. This is the sweet spot for entering swing trades. "
+                            f"Score: {p_mom['score']}/25.")
+            else:
+                mom_text = (f"RSI at **{rsi_val}** is elevated — the stock is overbought or "
+                            f"in a strong uptrend. Chasing here carries mean-reversion risk. "
+                            f"Score: {p_mom['score']}/25.")
+
+            # Trend narrative
+            if p_trend.get("macd") is not None:
+                macd_val = p_trend["macd"]
+                sig_val  = p_trend["signal_line"]
+                hist_val = p_trend["histogram"]
+                if macd_val > sig_val and hist_val > 0:
+                    trend_text = (f"MACD ({macd_val:.3f}) is **above** its signal line with a positive "
+                                  f"and {'expanding' if p_trend.get('hist_expanding') else 'contracting'} "
+                                  f"histogram — bullish trend confirmed. Score: {p_trend['score']}/35.")
+                elif macd_val < sig_val and hist_val < 0:
+                    trend_text = (f"MACD ({macd_val:.3f}) is **below** its signal line with a negative "
+                                  f"histogram — bearish trend in control. The engine penalises this heavily "
+                                  f"because trend is the highest-weight pillar (35pts). "
+                                  f"Score: {p_trend['score']}/35.")
+                else:
+                    trend_text = (f"MACD ({macd_val:.3f}) is near its signal line — trend is "
+                                  f"**transitioning**. Neither bulls nor bears have decisive control. "
+                                  f"Watch for a crossover as confirmation. Score: {p_trend['score']}/35.")
+            else:
+                trend_text = f"Insufficient data for MACD trend analysis. Score: {p_trend['score']}/35."
+
+            # Volatility / squeeze narrative
+            bb_pct = p_vol.get("bb_pct_rank", 50)
+            squeeze = p_vol.get("squeeze_active", False)
+            if squeeze:
+                vol_text = (f"Bollinger Band width is at the **{bb_pct:.0f}th percentile** of its "
+                            f"60-day range — a **volatility squeeze is active**. Historically, squeezes "
+                            f"resolve with an explosive directional move. The direction is unknown until "
+                            f"price breaks out, but the setup is high-reward when entered correctly. "
+                            f"Smart stop set at ${p_vol['smart_stop']:,.2f} "
+                            f"({p_vol['atr_mult']}×ATR-14 below entry). Score: {p_vol['score']}/25.")
+            elif bb_pct < 40:
+                vol_text = (f"Bands are relatively tight ({bb_pct:.0f}th percentile) — volatility is "
+                            f"low, not yet a textbook squeeze but compressing. Risk per share is contained. "
+                            f"Smart stop: ${p_vol['smart_stop']:,.2f}. Score: {p_vol['score']}/25.")
+            else:
+                vol_text = (f"Bollinger Bands are wide ({bb_pct:.0f}th percentile) — volatility is "
+                            f"elevated. Wider stops required, meaning smaller position sizes for the "
+                            f"same dollar risk. Smart stop: ${p_vol['smart_stop']:,.2f}. "
+                            f"Score: {p_vol['score']}/25.")
+
+            # Relative strength narrative
+            if p_rs.get("alpha") is not None:
+                alpha = p_rs["alpha"]
+                ticker_r = p_rs["ticker_return"]
+                spy_r    = p_rs["spy_return"]
+                lb       = p_rs["lookback_days"]
+                if alpha > 3:
+                    rs_text = (f"Over {lb} days, {selected_ticker} returned **{ticker_r:+.1f}%** vs "
+                               f"SPY's {spy_r:+.1f}% — outperforming the market by **{alpha:+.1f}%**. "
+                               f"Sector rotation and institutional accumulation tend to favour stocks "
+                               f"already showing relative strength. Score: {p_rs['score']}/15.")
+                elif alpha > -3:
+                    rs_text = (f"Over {lb} days, {selected_ticker} returned **{ticker_r:+.1f}%** vs "
+                               f"SPY's {spy_r:+.1f}% — roughly **in line with the market** "
+                               f"(alpha {alpha:+.1f}%). No edge from relative strength. "
+                               f"Score: {p_rs['score']}/15.")
+                else:
+                    rs_text = (f"Over {lb} days, {selected_ticker} returned **{ticker_r:+.1f}%** vs "
+                               f"SPY's {spy_r:+.1f}% — **underperforming by {abs(alpha):.1f}%**. "
+                               f"Weak relative strength suggests institutional selling or sector "
+                               f"headwinds. Score: {p_rs['score']}/15.")
+            else:
+                rs_text = f"SPY comparison unavailable. Relative strength scored at {p_rs['score']}/15."
+
+            # Overall verdict
+            if conf >= 80:
+                verdict = (f"All four pillars align. At **{conf:.0f}/100**, this is a **high-confidence "
+                           f"setup** — the kind institutional traders act on. Entry at "
+                           f"${_uce_result['entry_price']:,.2f}, risk {_uce_result['stop_pct']:.1f}% "
+                           f"to stop, targeting {_uce_result['target_pct']:.1f}% upside "
+                           f"({_uce_result['reward_multiple']}×R). Position sizing caps your loss at "
+                           f"{uce_max_drawdown:.1f}% of deployed capital regardless of what happens.")
+            elif conf >= 50:
+                verdict = (f"At **{conf:.0f}/100**, this is a **speculative setup** — some pillars "
+                           f"confirm but the trend or momentum is not fully aligned. Smaller size or "
+                           f"waiting for a confirming catalyst (earnings, breakout, volume spike) is "
+                           f"prudent before entering. The R:R ({_uce_result['reward_multiple']}×) "
+                           f"remains valid if you do enter.")
+            else:
+                verdict = (f"At **{conf:.0f}/100**, the signal says **avoid or wait**. Multiple pillars "
+                           f"are bearish — entering against a low-confidence signal means fighting "
+                           f"the tape. The stop and target are calculated for reference, but the "
+                           f"base case is to hold cash and re-scan when momentum and trend improve.")
+
+            st.markdown(
+                f"**Momentum (RSI):** {mom_text}\n\n"
+                f"**Trend (MACD):** {trend_text}\n\n"
+                f"**Volatility (BB + ATR):** {vol_text}\n\n"
+                f"**Relative Strength vs SPY:** {rs_text}\n\n"
+                f"---\n"
+                f"**Verdict:** {verdict}"
             )
 
 
