@@ -427,6 +427,35 @@ with st.sidebar:
                    "ev": w_ev,           "fcf_yield": w_fcf_yld, "ddm": w_ddm}
 
     st.markdown("---")
+    st.markdown("#### 🏰 Moat Strength")
+    moat_choice = st.selectbox(
+        "Economic Moat",
+        ["None", "Narrow", "Wide"],
+        index=0,
+        key="moat_choice",
+        help=(
+            "None — commodity business, no durable advantage.\n"
+            "Narrow — some pricing power or cost advantage; moderate durability.\n"
+            "Wide — brand/network/switching costs; durable multi-decade advantage "
+            "(think AAPL, MSFT, V). Raises terminal growth, extends high-growth horizon, "
+            "and applies a premium to EV multiples."
+        )
+    )
+    # Moat adjustment factors applied at valuation time
+    _moat_map = {
+        "None":   {"terminal_growth": 0.030, "high_growth_years": 5,  "ev_premium": 1.00},
+        "Narrow": {"terminal_growth": 0.035, "high_growth_years": 7,  "ev_premium": 1.15},
+        "Wide":   {"terminal_growth": 0.040, "high_growth_years": 10, "ev_premium": 1.30},
+    }
+    moat_params = _moat_map[moat_choice]
+    if moat_choice != "None":
+        st.caption(
+            f"Moat ({moat_choice}): terminal growth +{(moat_params['terminal_growth']-0.03)*100:.1f}pp · "
+            f"{moat_params['high_growth_years']}-yr high-growth window · "
+            f"{(moat_params['ev_premium']-1)*100:.0f}% EV multiple premium"
+        )
+
+    st.markdown("---")
     st.markdown("#### 🎯 Confluence Engine")
     uce_trade_type    = st.radio("Trade Type", ["Swing", "Day"], index=0,
                                  key="uce_trade_type", horizontal=True)
@@ -548,16 +577,27 @@ with tab1:
 
     # ── COMPUTE FAIR VALUES — INSTITUTIONAL GRADE ────────────
     # Two-stage 10yr DCF with CAPM-derived WACC (risk_free=4.5%, ERP=5.5%)
-    dcf = dcf_valuation(fcf, dcf_growth, shares, beta=beta)
+    # Moat raises terminal_growth and extends high-growth window
+    dcf = dcf_valuation(
+        fcf, dcf_growth, shares, beta=beta,
+        terminal_growth=moat_params["terminal_growth"],
+        high_growth_years=moat_params["high_growth_years"],
+    )
 
     # Forward P/E first, trailing fallback
     pe_val, pe_eps_label = pe_based_valuation(eps, forward_eps, sector_mults["pe"])
 
-    # EV/EBITDA — primary institutional multiple
-    ev_val = ev_ebitda_valuation(ebitda, net_debt, shares, sector_mults["ev_ebitda"])
+    # EV/EBITDA — primary institutional multiple; moat applies premium to sector multiple
+    ev_val = ev_ebitda_valuation(
+        ebitda, net_debt, shares,
+        sector_mults["ev_ebitda"] * moat_params["ev_premium"]
+    )
 
-    # EV/EBIT — more conservative, strips D&A; PE/HF standard for LBO analysis
-    ev_ebit_val = ev_ebit_valuation(ebit, net_debt, shares, sector_mults["ev_ebit"])
+    # EV/EBIT — more conservative, strips D&A; moat premium applied
+    ev_ebit_val = ev_ebit_valuation(
+        ebit, net_debt, shares,
+        sector_mults["ev_ebit"] * moat_params["ev_premium"]
+    )
 
     # FCF Yield — anchors price to required investor return threshold
     fcf_yield_val = fcf_yield_valuation(fcf, shares,
@@ -624,7 +664,7 @@ with tab1:
             Current Price: <b style="color:#f1f5f9">{price_str}</b> &nbsp;|&nbsp;
             Upside / Downside: <b style="color:{border_color}">{upside_str}</b>
           </div>
-          <div style="color:#64748b;font-size:0.75rem;margin-top:4px">Weights: {weight_note}</div>
+          <div style="color:#64748b;font-size:0.75rem;margin-top:4px">Weights: {weight_note} &nbsp;|&nbsp; Moat: <b style="color:#a78bfa">{moat_choice}</b></div>
         </div>
         <div style="text-align:right">
           <div style="color:#94a3b8;font-size:0.8rem">Fundamental Score</div>
