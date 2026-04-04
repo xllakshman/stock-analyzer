@@ -17,7 +17,7 @@ from utils.calculations import (
     dividend_discount_model, composite_fair_value,
     fundamental_signal, fundamental_score,
     technical_score, investment_decision, tranche_plan,
-    find_support_resistance,
+    find_support_resistance, StockDecisionEngine,
 )
 from utils.charts import (
     price_chart, rsi_chart, macd_chart,
@@ -426,6 +426,19 @@ with st.sidebar:
                    "ev": w_ev,           "fcf_yield": w_fcf_yld, "ddm": w_ddm}
 
     st.markdown("---")
+    st.markdown("#### 🎯 Confluence Engine")
+    uce_trade_type    = st.radio("Trade Type", ["Swing", "Day"], index=0,
+                                 key="uce_trade_type", horizontal=True)
+    uce_max_drawdown  = st.slider("Max Drawdown per Trade (%)", 1.0, 20.0, 5.0, 0.5,
+                                  key="uce_max_drawdown",
+                                  help="Maximum % loss you accept before stopping out. "
+                                       "Drives position sizing and stop placement.")
+    st.caption(
+        "Swing = 2.5×ATR stop, 30-day alpha · "
+        "Day = 1.5×ATR stop, 10-day alpha (uses daily data only)"
+    )
+
+    st.markdown("---")
     if st.button("Analyze", type="primary", use_container_width=True):
         st.cache_data.clear()
 
@@ -446,6 +459,11 @@ if not selected_ticker:
 with st.spinner(f"Loading {selected_ticker}..."):
     fund_data = extract_fundamentals(selected_ticker)
     hist_df   = fetch_history(selected_ticker, period)
+    # SPY required for UCE Relative Strength pillar — fetch quietly, never block on failure
+    try:
+        spy_df = fetch_history("SPY", period)
+    except Exception:
+        spy_df = None
 
 # Rate-limit / empty-data guard
 _price_ok = fund_data.get("current_price") is not None
@@ -902,6 +920,204 @@ Measures the average daily price swing over 14 days. Higher ATR = more volatile 
         with col4:
             st.plotly_chart(atr_chart(hist_df), use_container_width=True,
                             config={"displayModeBar": False})
+
+        # ══════════════════════════════════════════════════════
+        # UNIVERSAL CONFLUENCE ENGINE (UCE)
+        # ══════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("## 🎯 Universal Confluence Engine")
+        st.markdown(
+            '<div style="color:#94a3b8;font-size:0.84rem;margin-bottom:14px">'
+            'Synthesizes 4 technical pillars into a single high-confidence trade signal. '
+            f'Trade type: <b>{uce_trade_type}</b> · '
+            f'Max drawdown: <b>{uce_max_drawdown:.1f}%</b>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        _uce = StockDecisionEngine(
+            ticker=selected_ticker,
+            df=hist_df,
+            spy_df=spy_df if 'spy_df' in dir() else None,
+            trade_type=uce_trade_type,
+            max_drawdown_pct=uce_max_drawdown,
+        )
+        _uce_result = _uce.analyze()
+
+        if "error" in _uce_result:
+            st.warning(f"Confluence Engine: {_uce_result['error']}")
+        else:
+            conf        = _uce_result["confidence"]
+            rec         = _uce_result["recommendation"]
+            rec_color   = _uce_result["rec_color"]
+            rec_border  = _uce_result["rec_border"]
+            pillars     = _uce_result["pillars"]
+            p_mom       = pillars["momentum"]
+            p_trend     = pillars["trend"]
+            p_vol       = pillars["volatility"]
+            p_rs        = pillars["rel_strength"]
+
+            # ── Confidence banner ──
+            conf_bar_w = int(conf)
+            st.markdown(f"""
+            <div style="background:{rec_color};border:1px solid {rec_border};
+                        border-radius:8px;padding:16px 20px;margin-bottom:16px">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>
+                  <span style="font-size:1.25rem;font-weight:700;color:#f1f5f9">{rec}</span>
+                  <div style="color:#94a3b8;font-size:0.83rem;margin-top:6px">
+                    Entry: <b style="color:#f1f5f9">${_uce_result['entry_price']:,.2f}</b>
+                    &nbsp;·&nbsp; Stop: <b style="color:#ef4444">${_uce_result['effective_stop']:,.2f}</b>
+                    &nbsp;({_uce_result['stop_pct']:.1f}% below · {_uce_result['stop_driver']})
+                    &nbsp;·&nbsp; Risk/share: <b style="color:#f1f5f9">${_uce_result['risk_per_share']:.2f}</b>
+                  </div>
+                  <div style="color:#64748b;font-size:0.77rem;margin-top:3px">
+                    Position sizing: {_uce_result['shares_per_10k']} shares per $10k
+                    (stops out at ${_uce_result['capital_at_risk_10k']:.0f} loss = {uce_max_drawdown:.1f}% of $10k)
+                  </div>
+                </div>
+                <div style="text-align:right">
+                  <div style="color:#94a3b8;font-size:0.8rem">Confidence Score</div>
+                  <div style="font-size:2.2rem;font-weight:700;color:{rec_border}">{conf:.0f}%</div>
+                </div>
+              </div>
+              <div style="margin-top:10px;background:#0f172a;border-radius:4px;height:8px;overflow:hidden">
+                <div style="width:{conf_bar_w}%;height:100%;background:{rec_border};
+                            border-radius:4px;transition:width 0.5s"></div>
+              </div>
+              <div style="display:flex;justify-content:space-between;
+                          color:#475569;font-size:0.7rem;margin-top:2px">
+                <span>0 — Avoid</span><span>50 — Speculative</span><span>80+ — High Confidence</span>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            # ── Pillar Analysis Table ──
+            st.markdown("### Pillar Analysis")
+
+            def _score_bar(score, max_score):
+                pct = int(score / max_score * 100) if max_score > 0 else 0
+                color = "#22c55e" if pct >= 70 else ("#eab308" if pct >= 40 else "#ef4444")
+                return (
+                    f'<div style="background:#0f172a;border-radius:3px;height:6px;'
+                    f'width:80px;display:inline-block;vertical-align:middle">'
+                    f'<div style="width:{pct}%;height:100%;background:{color};border-radius:3px"></div></div>'
+                    f' <span style="color:{color};font-size:0.78rem">{score}/{max_score}</span>'
+                )
+
+            rows = [
+                {
+                    "Pillar":     "1 · Momentum",
+                    "Indicator":  f"RSI-14 = <b>{p_mom['rsi']}</b>",
+                    "Detail":     f"5-day slope: {p_mom['rsi_slope_5d']:+.1f} → {p_mom['slope_signal']}",
+                    "Signal":     p_mom["signal"],
+                    "Score":      _score_bar(p_mom["score"], p_mom["max_score"]),
+                },
+                {
+                    "Pillar":     "2 · Trend",
+                    "Indicator":  (f"MACD {p_trend['macd']:.4f} / Sig {p_trend['signal_line']:.4f}"
+                                   if p_trend.get("macd") is not None else "MACD"),
+                    "Detail":     (f"Histogram {p_trend['histogram']:+.4f} · "
+                                   f"{'Below Zero ✅' if p_trend.get('below_zero') else 'Above Zero'} · "
+                                   f"{p_trend.get('histogram_signal', '')}"
+                                   if p_trend.get("macd") is not None else "—"),
+                    "Signal":     p_trend["signal"],
+                    "Score":      _score_bar(p_trend["score"], p_trend["max_score"]),
+                },
+                {
+                    "Pillar":     "3 · Volatility",
+                    "Indicator":  f"BB Width = {p_vol['bb_width']:.5f} ({p_vol['bb_pct_rank']:.0f}th pct)",
+                    "Detail":     (f"{'🔴 SQUEEZE ACTIVE' if p_vol['squeeze_active'] else 'No squeeze'} · "
+                                   f"ATR-14 = {p_vol['atr_14']} · "
+                                   f"Smart Stop = ${p_vol['smart_stop']:,.2f} "
+                                   f"({p_vol['atr_mult']}×ATR, -{p_vol['smart_stop_pct']:.1f}%)"),
+                    "Signal":     p_vol["signal"],
+                    "Score":      _score_bar(p_vol["score"], p_vol["max_score"]),
+                },
+                {
+                    "Pillar":     "4 · Rel. Strength",
+                    "Indicator":  (
+                        f"{selected_ticker} {p_rs['ticker_return']:+.1f}% / "
+                        f"SPY {p_rs['spy_return']:+.1f}%"
+                        if p_rs.get("spy_return") is not None
+                        else f"{selected_ticker} {p_rs.get('ticker_return', 0):+.1f}% (no SPY)"
+                    ),
+                    "Detail":     (
+                        f"Alpha: {p_rs['alpha']:+.1f}% over {p_rs['lookback_days']}d"
+                        if p_rs.get("alpha") is not None else f"({p_rs['lookback_days']}d window)"
+                    ),
+                    "Signal":     p_rs["signal"],
+                    "Score":      _score_bar(p_rs["score"], p_rs["max_score"]),
+                },
+            ]
+
+            # Render as styled HTML table
+            table_html = """
+            <table style="width:100%;border-collapse:collapse;font-size:0.82rem">
+              <thead>
+                <tr style="border-bottom:1px solid #334155;color:#94a3b8">
+                  <th style="text-align:left;padding:8px 10px;width:12%">Pillar</th>
+                  <th style="text-align:left;padding:8px 10px;width:20%">Indicator</th>
+                  <th style="text-align:left;padding:8px 10px;width:28%">Detail</th>
+                  <th style="text-align:left;padding:8px 10px;width:28%">Signal</th>
+                  <th style="text-align:left;padding:8px 10px;width:12%">Score</th>
+                </tr>
+              </thead>
+              <tbody>
+            """
+            for i, row in enumerate(rows):
+                bg = "#1e293b" if i % 2 == 0 else "#0f172a"
+                table_html += f"""
+                <tr style="background:{bg};border-bottom:1px solid #1e293b">
+                  <td style="padding:9px 10px;color:#94a3b8;font-weight:600">{row['Pillar']}</td>
+                  <td style="padding:9px 10px;color:#f1f5f9">{row['Indicator']}</td>
+                  <td style="padding:9px 10px;color:#94a3b8">{row['Detail']}</td>
+                  <td style="padding:9px 10px;color:#f1f5f9">{row['Signal']}</td>
+                  <td style="padding:9px 10px">{row['Score']}</td>
+                </tr>"""
+            table_html += "</tbody></table>"
+            st.markdown(table_html, unsafe_allow_html=True)
+
+            # ── Trade Setup Summary ──
+            st.markdown("### Trade Setup")
+            ts1, ts2, ts3, ts4 = st.columns(4)
+            def _ts_card(label, value, sub="", color="#f1f5f9"):
+                return (
+                    f'<div class="metric-card">'
+                    f'<div class="metric-label">{label}</div>'
+                    f'<div class="metric-value" style="color:{color}">{value}</div>'
+                    f'<div class="metric-sub">{sub}</div></div>'
+                )
+            with ts1:
+                st.markdown(_ts_card("Entry Price",
+                    f"${_uce_result['entry_price']:,.2f}",
+                    "Current market price"), unsafe_allow_html=True)
+            with ts2:
+                st.markdown(_ts_card("Stop Loss (Effective)",
+                    f"${_uce_result['effective_stop']:,.2f}",
+                    f"-{_uce_result['stop_pct']:.1f}% · {_uce_result['stop_driver']}",
+                    color="#ef4444"), unsafe_allow_html=True)
+            with ts3:
+                st.markdown(_ts_card("Risk per Share",
+                    f"${_uce_result['risk_per_share']:.2f}",
+                    f"Entry minus effective stop"), unsafe_allow_html=True)
+            with ts4:
+                st.markdown(_ts_card("Position Size / $10k",
+                    f"{_uce_result['shares_per_10k']} shares",
+                    f"Max loss ≈ ${_uce_result['capital_at_risk_10k']:.0f} "
+                    f"({uce_max_drawdown:.1f}% of $10k)"), unsafe_allow_html=True)
+
+            # ── Score waterfall note ──
+            st.markdown(
+                f'<div style="color:#64748b;font-size:0.75rem;margin-top:8px">'
+                f'Score breakdown: Momentum {p_mom["score"]}/25 · '
+                f'Trend {p_trend["score"]}/35 · '
+                f'Volatility {p_vol["score"]}/25 · '
+                f'Rel. Strength {p_rs["score"]}/15 · '
+                f'<b>Total {conf:.0f}/100</b> · '
+                f'Thresholds: &gt;80 High-Confidence Buy · 50–80 Speculative · &lt;50 Avoid'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
 
 # ══════════════════════════════════════════════════════════════

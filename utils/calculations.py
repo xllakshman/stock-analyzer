@@ -606,3 +606,356 @@ def tranche_plan(action, current_price, support_levels, resistance_levels):
         ]
 
     return plan, stop_loss, s1, s2, r1, r2
+
+
+# ─────────────────────────────────────────────
+# UNIVERSAL CONFLUENCE ENGINE (UCE)
+# ─────────────────────────────────────────────
+
+class StockDecisionEngine:
+    """
+    Universal Confluence Engine — synthesizes 4 technical pillars into a
+    single confidence score and actionable trade recommendation.
+
+    Pillars (max score):
+      1. Momentum — RSI-14 + 5-day slope          (25 pts)
+      2. Trend    — MACD 12,26,9 crossover + hist  (35 pts)
+      3. Volatility — BB Width squeeze + ATR stop  (25 pts)
+      4. Relative Strength — 30d alpha vs SPY      (15 pts)
+    Total: 100 pts
+
+    Thresholds:
+      > 80  → High-Confidence Buy
+      50–80 → Speculative Buy
+      < 50  → Neutral / Avoid
+    """
+
+    def __init__(self, ticker: str, df: pd.DataFrame,
+                 spy_df: pd.DataFrame = None,
+                 trade_type: str = "Swing",
+                 max_drawdown_pct: float = 5.0):
+        self.ticker          = ticker
+        self.df              = (df.copy() if isinstance(df, pd.DataFrame) and not df.empty
+                                else pd.DataFrame())
+        self.spy_df          = spy_df.copy() if spy_df is not None and not spy_df.empty else None
+        self.trade_type      = trade_type      # "Swing" | "Day"
+        self.max_drawdown_pct = max_drawdown_pct
+
+        # Swing vs Day: ATR multiplier and RSI thresholds differ
+        if trade_type == "Day":
+            self._atr_mult          = 1.5   # tighter stop for intraday
+            self._rsi_oversold      = 25    # stricter oversold
+            self._rsi_overbought    = 75
+            self._rs_lookback       = 10    # 2-week alpha window
+        else:
+            self._atr_mult          = 2.5
+            self._rsi_oversold      = 30
+            self._rsi_overbought    = 70
+            self._rs_lookback       = 30    # 30-day alpha window
+
+    # ─── Public entry point ───────────────────────────────────────
+    def analyze(self) -> dict:
+        if self.df.empty or len(self.df) < 30:
+            return {"error": "Insufficient data — need at least 30 trading days."}
+
+        close = self.df["Close"]
+        current_price = float(close.iloc[-1])
+
+        p1 = self._pillar1_momentum(close)
+        p2 = self._pillar2_trend(close)
+        p3 = self._pillar3_volatility(close, current_price)
+        p4 = self._pillar4_relative_strength(close)
+
+        # Raw score capped 0-100
+        raw_score = p1["score"] + p2["score"] + p3["score"] + p4["score"]
+        confidence = max(0, min(100, raw_score))
+
+        # Recommendation
+        if confidence > 80:
+            recommendation = "🟢 High-Confidence Buy"
+            action_label   = "HIGH-CONFIDENCE BUY"
+            rec_color      = "#14532d"
+            rec_border     = "#22c55e"
+        elif confidence >= 50:
+            recommendation = "🟡 Speculative Buy"
+            action_label   = "SPECULATIVE BUY"
+            rec_color      = "#713f12"
+            rec_border     = "#eab308"
+        else:
+            recommendation = "⚪ Neutral / Avoid"
+            action_label   = "AVOID"
+            rec_color      = "#1e293b"
+            rec_border     = "#475569"
+
+        # ── Stop Loss Logic ───────────────────────────────────────
+        smart_stop       = p3["smart_stop"]             # 2.5×ATR below price
+        drawdown_stop    = current_price * (1 - self.max_drawdown_pct / 100)
+        # Effective stop: whichever is higher (less loss)
+        effective_stop   = max(smart_stop, drawdown_stop)
+        stop_pct         = (current_price - effective_stop) / current_price * 100
+        stop_driver      = ("Max-Drawdown Rule" if drawdown_stop > smart_stop
+                            else f"Smart Stop ({self._atr_mult}×ATR)")
+
+        # ── Position Sizing ───────────────────────────────────────
+        risk_per_share   = current_price - effective_stop
+        # Shares needed so that a stop-out costs exactly max_drawdown_pct of $10k
+        if risk_per_share > 0:
+            shares_per_10k = int(10_000 * (self.max_drawdown_pct / 100) / risk_per_share)
+        else:
+            shares_per_10k = 0
+        capital_at_risk_10k = round(risk_per_share * shares_per_10k, 2)
+
+        return {
+            "ticker":           self.ticker,
+            "current_price":    current_price,
+            "trade_type":       self.trade_type,
+            "max_drawdown_pct": self.max_drawdown_pct,
+            "confidence":       round(confidence, 1),
+            "recommendation":   recommendation,
+            "action_label":     action_label,
+            "rec_color":        rec_color,
+            "rec_border":       rec_border,
+            "pillars": {
+                "momentum":      p1,
+                "trend":         p2,
+                "volatility":    p3,
+                "rel_strength":  p4,
+            },
+            "entry_price":          round(current_price, 2),
+            "smart_stop":           round(smart_stop, 2),
+            "effective_stop":       round(effective_stop, 2),
+            "stop_pct":             round(stop_pct, 2),
+            "stop_driver":          stop_driver,
+            "risk_per_share":       round(risk_per_share, 2),
+            "shares_per_10k":       shares_per_10k,
+            "capital_at_risk_10k":  capital_at_risk_10k,
+        }
+
+    # ─── Pillar 1: Momentum (RSI-14) ─────────────────────────────
+    def _pillar1_momentum(self, close: pd.Series) -> dict:
+        rsi_series  = rsi(close, 14)
+        curr_rsi    = float(rsi_series.iloc[-1])
+
+        # 5-day RSI slope (momentum shift detector)
+        lookback    = min(5, len(rsi_series) - 1)
+        slope       = float(rsi_series.iloc[-1] - rsi_series.iloc[-1 - lookback])
+
+        # Score based on RSI zone
+        if curr_rsi < self._rsi_oversold:
+            signal = f"🟢 Extreme Value — Oversold (RSI < {self._rsi_oversold})"
+            score  = 25
+        elif curr_rsi < 40:
+            signal = "🟢 Approaching Oversold"
+            score  = 18
+        elif curr_rsi < 50:
+            signal = "🟡 Below Midline — Mild Bearish Momentum"
+            score  = 10
+        elif curr_rsi < 60:
+            signal = "🟡 Above Midline — Mild Bullish Momentum"
+            score  = 13
+        elif curr_rsi < self._rsi_overbought:
+            signal = f"🟠 Approaching Overbought (RSI < {self._rsi_overbought})"
+            score  = 8
+        else:
+            signal = f"🔴 Overextension — Overbought (RSI > {self._rsi_overbought})"
+            score  = 0
+
+        # Slope bonus: RSI below 50 AND rising → early momentum shift
+        if slope > 3 and curr_rsi < 50:
+            slope_signal = "↑ Rising — Early Momentum Shift ✅"
+            score = min(score + 5, 25)
+        elif slope > 1:
+            slope_signal = "↗ Gradually Rising"
+        elif slope < -3:
+            slope_signal = "↓ Falling — Momentum Weakening"
+            if curr_rsi > 50:
+                score = max(score - 3, 0)
+        elif slope < -1:
+            slope_signal = "↘ Gradually Falling"
+        else:
+            slope_signal = "→ Flat"
+
+        return {
+            "rsi":            round(curr_rsi, 2),
+            "rsi_slope_5d":   round(slope, 2),
+            "signal":         signal,
+            "slope_signal":   slope_signal,
+            "score":          score,
+            "max_score":      25,
+        }
+
+    # ─── Pillar 2: Trend (MACD 12,26,9) ──────────────────────────
+    def _pillar2_trend(self, close: pd.Series) -> dict:
+        if len(close) < 26:
+            return {"signal": "⚪ Insufficient data for MACD", "score": 0,
+                    "max_score": 35, "macd": None, "signal_line": None,
+                    "histogram": None, "below_zero": None, "histogram_signal": "—"}
+
+        macd_line, signal_line, histogram = macd(close)
+
+        curr_macd   = float(macd_line.iloc[-1])
+        curr_sig    = float(signal_line.iloc[-1])
+        curr_hist   = float(histogram.iloc[-1])
+        prev_macd   = float(macd_line.iloc[-2])
+        prev_sig    = float(signal_line.iloc[-2])
+        prev_hist   = float(histogram.iloc[-2])
+
+        below_zero  = curr_macd < 0
+        cross_now   = curr_macd > curr_sig and prev_macd <= prev_sig   # fresh bullish cross
+        bear_cross  = curr_macd < curr_sig and prev_macd >= prev_sig   # fresh bearish cross
+
+        # Check for crossover within last 3 bars
+        recent_bull_cross = False
+        for i in range(-4, -1):
+            if (abs(i) < len(macd_line) and
+                    float(macd_line.iloc[i]) > float(signal_line.iloc[i]) and
+                    float(macd_line.iloc[i - 1]) <= float(signal_line.iloc[i - 1])):
+                recent_bull_cross = True
+                break
+
+        hist_expanding = abs(curr_hist) > abs(prev_hist)
+
+        # Scoring
+        if cross_now and below_zero:
+            signal = "🟢 Bullish Crossover Below Zero — Strongest Signal"
+            score  = 35
+        elif cross_now and not below_zero:
+            signal = "🟢 Bullish Crossover Above Zero"
+            score  = 22
+        elif recent_bull_cross and below_zero:
+            signal = "🟢 Recent Bullish Cross Below Zero (within 3 bars)"
+            score  = 28
+        elif recent_bull_cross:
+            signal = "🟡 Recent Bullish Cross (above zero)"
+            score  = 18
+        elif curr_macd > curr_sig:
+            signal = "🟡 MACD Above Signal — No Fresh Crossover"
+            score  = 12
+        elif bear_cross:
+            signal = "🔴 Fresh Bearish Crossover"
+            score  = 0
+        else:
+            signal = "🔴 MACD Below Signal — Bearish Trend"
+            score  = 5
+
+        # Histogram modifier (±5, within [0, max_score])
+        if hist_expanding and score >= 20:
+            hist_signal = "📈 Expanding — Trend Accelerating ✅"
+            score = min(score + 5, 35)
+        elif not hist_expanding and score >= 20:
+            hist_signal = "📉 Contracting — Trend Exhaustion ⚠️"
+            score = max(score - 5, 0)
+        elif hist_expanding:
+            hist_signal = "📈 Expanding"
+        else:
+            hist_signal = "📉 Contracting"
+
+        return {
+            "macd":             round(curr_macd, 4),
+            "signal_line":      round(curr_sig, 4),
+            "histogram":        round(curr_hist, 4),
+            "below_zero":       below_zero,
+            "signal":           signal,
+            "histogram_signal": hist_signal,
+            "score":            score,
+            "max_score":        35,
+        }
+
+    # ─── Pillar 3: Volatility (BB Width + ATR) ───────────────────
+    def _pillar3_volatility(self, close: pd.Series, current_price: float) -> dict:
+        upper, mid, lower = bollinger_bands(close, period=20, std_dev=2)
+        bb_width = ((upper - lower) / mid.replace(0, np.nan)).fillna(0)
+
+        curr_bbw = float(bb_width.iloc[-1])
+        lookback = min(60, len(bb_width))
+        bbw_60d  = bb_width.iloc[-lookback:]
+        pct20    = float(bbw_60d.quantile(0.20))
+        squeeze  = curr_bbw <= pct20
+        bbw_pct  = float((bbw_60d <= curr_bbw).mean() * 100)
+
+        # ATR smart stop
+        atr_val     = atr(self.df, period=14)
+        curr_atr    = float(atr_val.iloc[-1])
+        smart_stop  = current_price - self._atr_mult * curr_atr
+        stop_pct    = (current_price - smart_stop) / current_price * 100
+
+        # Scoring
+        if squeeze:
+            signal = f"🟢 Volatility Squeeze — BB Width ≤ 20th percentile ({bbw_pct:.0f}th). Breakout Imminent"
+            score  = 25
+        elif bbw_pct <= 40:
+            signal = f"🟡 Low-Normal Volatility (BB Width at {bbw_pct:.0f}th percentile)"
+            score  = 15
+        elif bbw_pct <= 70:
+            signal = f"🟡 Normal Volatility (BB Width at {bbw_pct:.0f}th percentile)"
+            score  = 8
+        else:
+            signal = f"🔴 Elevated Volatility — Risk Raised (BB Width at {bbw_pct:.0f}th percentile)"
+            score  = 0
+
+        return {
+            "bb_width":         round(curr_bbw, 5),
+            "bb_pct_rank":      round(bbw_pct, 1),
+            "squeeze_active":   squeeze,
+            "atr_14":           round(curr_atr, 3),
+            "atr_mult":         self._atr_mult,
+            "smart_stop":       round(smart_stop, 2),
+            "smart_stop_pct":   round(stop_pct, 2),
+            "signal":           signal,
+            "score":            score,
+            "max_score":        25,
+        }
+
+    # ─── Pillar 4: Relative Strength vs SPY ──────────────────────
+    def _pillar4_relative_strength(self, close: pd.Series) -> dict:
+        lb = self._rs_lookback
+        if len(close) < lb:
+            return {"signal": "⚪ Insufficient data", "score": 5, "max_score": 15,
+                    "ticker_return": None, "spy_return": None, "alpha": None}
+
+        ticker_ret = float((close.iloc[-1] / close.iloc[-lb] - 1) * 100)
+
+        spy_ret = None
+        if self.spy_df is not None and len(self.spy_df) >= lb:
+            sc = self.spy_df["Close"]
+            spy_ret = float((sc.iloc[-1] / sc.iloc[-lb] - 1) * 100)
+
+        alpha = (ticker_ret - spy_ret) if spy_ret is not None else None
+
+        if alpha is not None:
+            if alpha > 10:
+                signal = f"🟢 Strong Outperformer — Alpha +{alpha:.1f}% vs SPY"
+                score  = 15
+            elif alpha > 5:
+                signal = f"🟢 Outperforming SPY by +{alpha:.1f}%"
+                score  = 12
+            elif alpha > 0:
+                signal = f"🟡 Slight Outperformance (+{alpha:.1f}% alpha)"
+                score  = 8
+            elif alpha > -5:
+                signal = f"🟠 Slight Underperformance ({alpha:.1f}% alpha)"
+                score  = 4
+            else:
+                signal = f"🔴 Underperforming SPY by {alpha:.1f}%"
+                score  = 0
+        else:
+            # Fallback: absolute return only
+            if ticker_ret > 5:
+                signal = f"🟡 +{ticker_ret:.1f}% return ({lb}d) — No SPY data"
+                score  = 8
+            elif ticker_ret > 0:
+                signal = f"🟡 +{ticker_ret:.1f}% ({lb}d) — No SPY data"
+                score  = 5
+            else:
+                signal = f"🟠 {ticker_ret:.1f}% ({lb}d) — No SPY data"
+                score  = 2
+
+        return {
+            "ticker_return":  round(ticker_ret, 2),
+            "spy_return":     round(spy_ret, 2) if spy_ret is not None else None,
+            "alpha":          round(alpha, 2) if alpha is not None else None,
+            "lookback_days":  lb,
+            "signal":         signal,
+            "score":          score,
+            "max_score":      15,
+        }
