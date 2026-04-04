@@ -705,6 +705,12 @@ class StockDecisionEngine:
             shares_per_10k = 0
         capital_at_risk_10k = round(risk_per_share * shares_per_10k, 2)
 
+        # Profit target: reward-to-risk multiple
+        # Swing = 2.5×R, Day = 2.0×R — institutional minimums
+        reward_multiple = 2.5 if self.trade_type == "Swing" else 2.0
+        target_price    = round(current_price + risk_per_share * reward_multiple, 2)
+        target_pct      = round((target_price - current_price) / current_price * 100, 2)
+
         return {
             "ticker":           self.ticker,
             "current_price":    current_price,
@@ -729,6 +735,9 @@ class StockDecisionEngine:
             "risk_per_share":       round(risk_per_share, 2),
             "shares_per_10k":       shares_per_10k,
             "capital_at_risk_10k":  capital_at_risk_10k,
+            "target_price":         target_price,
+            "target_pct":           target_pct,
+            "reward_multiple":      reward_multiple,
         }
 
     # ─── Pillar 1: Momentum (RSI-14) ─────────────────────────────

@@ -969,6 +969,8 @@ Measures the average daily price swing over 14 days. Higher ATR = more volatile 
                     Entry: <b style="color:#f1f5f9">${_uce_result['entry_price']:,.2f}</b>
                     &nbsp;·&nbsp; Stop: <b style="color:#ef4444">${_uce_result['effective_stop']:,.2f}</b>
                     &nbsp;({_uce_result['stop_pct']:.1f}% below · {_uce_result['stop_driver']})
+                    &nbsp;·&nbsp; Target: <b style="color:#22c55e">${_uce_result['target_price']:,.2f}</b>
+                    &nbsp;(+{_uce_result['target_pct']:.1f}% · {_uce_result['reward_multiple']}×R)
                     &nbsp;·&nbsp; Risk/share: <b style="color:#f1f5f9">${_uce_result['risk_per_share']:.2f}</b>
                   </div>
                   <div style="color:#64748b;font-size:0.77rem;margin-top:3px">
@@ -1075,11 +1077,12 @@ Measures the average daily price swing over 14 days. Higher ATR = more volatile 
                   <td style="padding:9px 10px">{row['Score']}</td>
                 </tr>"""
             table_html += "</tbody></table>"
-            st.markdown(table_html, unsafe_allow_html=True)
+            # .strip() prevents leading whitespace from triggering markdown code-block rendering
+            st.markdown(table_html.strip(), unsafe_allow_html=True)
 
             # ── Trade Setup Summary ──
             st.markdown("### Trade Setup")
-            ts1, ts2, ts3, ts4 = st.columns(4)
+            ts1, ts2, ts3, ts4, ts5 = st.columns(5)
             def _ts_card(label, value, sub="", color="#f1f5f9"):
                 return (
                     f'<div class="metric-card">'
@@ -1092,15 +1095,20 @@ Measures the average daily price swing over 14 days. Higher ATR = more volatile 
                     f"${_uce_result['entry_price']:,.2f}",
                     "Current market price"), unsafe_allow_html=True)
             with ts2:
-                st.markdown(_ts_card("Stop Loss (Effective)",
+                st.markdown(_ts_card("Stop Loss",
                     f"${_uce_result['effective_stop']:,.2f}",
                     f"-{_uce_result['stop_pct']:.1f}% · {_uce_result['stop_driver']}",
                     color="#ef4444"), unsafe_allow_html=True)
             with ts3:
+                st.markdown(_ts_card("Exit Target",
+                    f"${_uce_result['target_price']:,.2f}",
+                    f"+{_uce_result['target_pct']:.1f}% · {_uce_result['reward_multiple']}×R",
+                    color="#22c55e"), unsafe_allow_html=True)
+            with ts4:
                 st.markdown(_ts_card("Risk per Share",
                     f"${_uce_result['risk_per_share']:.2f}",
-                    f"Entry minus effective stop"), unsafe_allow_html=True)
-            with ts4:
+                    "Entry minus stop"), unsafe_allow_html=True)
+            with ts5:
                 st.markdown(_ts_card("Position Size / $10k",
                     f"{_uce_result['shares_per_10k']} shares",
                     f"Max loss ≈ ${_uce_result['capital_at_risk_10k']:.0f} "
