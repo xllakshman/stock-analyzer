@@ -480,132 +480,174 @@ def investment_decision(fund_score: int, tech_score: int):
 
 def tranche_plan(action, current_price, support_levels, resistance_levels):
     """
-    Generate tranche deployment / exit plan.
+    5-tranche deployment plan — each tranche = 20% of allocated capital.
 
-    Key fix: support levels from price history may be ABOVE current price when
-    a stock has broken down below historical lows.  We filter to strictly-below
-    levels and enforce a minimum spread between tranches so the plan is
-    actionable and actually mitigates timing risk.
+    DOWNSIDE TABLE (buy into weakness):
+      5 entry levels spread from current price to ~35% below.
+      Max drawdown cap: ~38% below T1 (stop sits 3% under T5).
+      Price levels snap to nearby chart supports where available.
 
-    BUY tranches spread ~7% and ~15% below current price.
-    SELL tranches spread ~8% and ~15% above current price.
+    UPSIDE TABLE (scale-out / profit targets):
+      5 exit levels spread from ~8% above to ~40% above current price.
+      Price levels snap to nearby chart resistances where available.
+
+    Returns
+    -------
+    down_plan  : list[dict] — 5 downside rows + 1 summary row
+    up_plan    : list[dict] — 5 upside rows + 1 summary row
+    stop_loss  : float — hard stop (3% below T5 downside level)
+    levels     : dict — d1..d5, u1..u5 price floats for metric cards
     """
-    # ── Supports: only levels strictly BELOW current price ─────────────────
+    cp = current_price  # shorthand
+
+    # ── Default downside levels: 0%, -8%, -16%, -25%, -35% ────────────────
+    _d_defaults = [0.00, 0.08, 0.16, 0.25, 0.35]
+
+    # ── Snap to chart supports where a support falls within ±2.5% of default ─
     below_s = sorted(
-        [s for s in support_levels if s < current_price * 0.995],
-        reverse=True   # nearest (highest) first
+        [s for s in support_levels if s < cp * 0.998],
+        reverse=True   # nearest first
     )
 
-    # Tranche 2: nearest support that is at least 5% below current
-    deep_enough_s1 = [s for s in below_s if (current_price - s) / current_price >= 0.05]
-    if deep_enough_s1:
-        s1 = round(deep_enough_s1[0], 2)
-    else:
-        s1 = round(current_price * 0.93, 2)   # default: 7% pullback
+    def _snap_down(default_pct, used):
+        """Return a downside price level, snapping to nearest unused support."""
+        target = cp * (1 - default_pct)
+        for s in below_s:
+            if s in used:
+                continue
+            if abs(s - target) / cp <= 0.025:   # within 2.5% of default
+                used.add(s)
+                return round(s, 2)
+        return round(target, 2)
 
-    # Tranche 3: support at least 10% below current (meaningfully deeper)
-    deep_enough_s2 = [s for s in below_s if (current_price - s) / current_price >= 0.10]
-    if deep_enough_s2:
-        s2 = round(deep_enough_s2[0], 2)
-    else:
-        s2 = round(current_price * 0.85, 2)   # default: 15% pullback
+    used_d = set()
+    d_raw = [_snap_down(pct, used_d) for pct in _d_defaults]
 
-    # Guarantee s1 > s2 (s1 is closer, s2 is deeper)
-    if s1 <= s2:
-        s1 = round(current_price * 0.93, 2)
-        s2 = round(current_price * 0.85, 2)
+    # Enforce strict descending order with at least 5% separation
+    d = [round(cp, 2)]
+    for i in range(1, 5):
+        min_allowed = round(d[i - 1] * (1 - 0.05), 2)
+        candidate   = d_raw[i]
+        d.append(min(candidate, min_allowed))
 
-    # ── Resistances: only levels strictly ABOVE current price ──────────────
+    d1, d2, d3, d4, d5 = d
+    stop_loss = round(d5 * 0.97, 2)   # 3% below T5 ≈ 37-38% from entry
+
+    # ── Default upside levels: +8%, +15%, +23%, +30%, +40% ────────────────
+    _u_defaults = [0.08, 0.15, 0.23, 0.30, 0.40]
+
     above_r = sorted(
-        [r for r in resistance_levels if r > current_price * 1.005]
+        [r for r in resistance_levels if r > cp * 1.002]
     )
 
-    r1_candidates = [r for r in above_r if (r - current_price) / current_price >= 0.05]
-    r1 = round(r1_candidates[0], 2) if r1_candidates else round(current_price * 1.08, 2)
+    def _snap_up(default_pct, used):
+        target = cp * (1 + default_pct)
+        for r in above_r:
+            if r in used:
+                continue
+            if abs(r - target) / cp <= 0.025:
+                used.add(r)
+                return round(r, 2)
+        return round(target, 2)
 
-    r2_candidates = [r for r in above_r if (r - current_price) / current_price >= 0.12]
-    r2 = round(r2_candidates[0], 2) if r2_candidates else round(current_price * 1.15, 2)
+    used_u = set()
+    u_raw = [_snap_up(pct, used_u) for pct in _u_defaults]
 
-    if r1 >= r2:
-        r1 = round(current_price * 1.08, 2)
-        r2 = round(current_price * 1.15, 2)
+    # Enforce strict ascending order with at least 5% separation
+    u = [round(u_raw[0], 2)]
+    for i in range(1, 5):
+        min_allowed = round(u[i - 1] * 1.05, 2)
+        candidate   = u_raw[i]
+        u.append(max(candidate, min_allowed))
 
-    # ── Stop loss: just below the deep support (s2) ────────────────────────
-    stop_loss = round(s2 * 0.97, 2)
+    u1, u2, u3, u4, u5 = u
 
-    # ── Compute % distances for display ────────────────────────────────────
-    s1_pct = round((current_price - s1) / current_price * 100, 1)
-    s2_pct = round((current_price - s2) / current_price * 100, 1)
-    r1_pct = round((r1 - current_price) / current_price * 100, 1)
-    r2_pct = round((r2 - current_price) / current_price * 100, 1)
+    # ── Compute % distances ────────────────────────────────────────────────
+    def _pct_dn(price): return round((cp - price) / cp * 100, 1)
+    def _pct_up(price): return round((price - cp) / cp * 100, 1)
 
-    if action in ("BUY", "ACCUMULATE"):
-        plan = [
-            {
-                "Tranche":     "1st Buy — 30%",
-                "Price Level": f"${current_price:.2f}",
-                "Trigger":     "Enter now at current price",
-                "Rationale":   "Fair/undervalued entry — initiate position",
-                "Risk":        "Baseline entry risk",
-            },
-            {
-                "Tranche":     "2nd Buy — 30%",
-                "Price Level": f"${s1:.2f}",
-                "Trigger":     f"Price drops -{s1_pct}% to ${s1:.2f}",
-                "Rationale":   f"Add at Support 1 — reduces avg cost by ~{s1_pct/2:.1f}%",
-                "Risk":        f"Avg cost reduces if price recovers",
-            },
-            {
-                "Tranche":     "3rd Buy — 40%",
-                "Price Level": f"${s2:.2f}",
-                "Trigger":     f"Price drops -{s2_pct}% to ${s2:.2f}",
-                "Rationale":   f"Maximum allocation at deep value — largest tranche at best price",
-                "Risk":        f"Stop loss at ${stop_loss:.2f} (-{round((current_price-stop_loss)/current_price*100,1)}%)",
-            },
-        ]
-    elif action == "HOLD":
-        plan = [
-            {
-                "Tranche":     "Hold — no new buy",
-                "Price Level": "—",
-                "Trigger":     "Monitor for direction",
-                "Rationale":   "Wait for breakout above resistance or pullback to support",
-                "Risk":        "No new capital deployed",
-            },
-            {
-                "Tranche":     "Trim 20% on rally",
-                "Price Level": f"${r1:.2f}",
-                "Trigger":     f"Price rises +{r1_pct}% to ${r1:.2f}",
-                "Rationale":   "Book partial profits at Resistance 1",
-                "Risk":        "Reduces position size; keeps core holding",
-            },
-        ]
-    else:  # REDUCE / SELL
-        plan = [
-            {
-                "Tranche":     "Trim 30%",
-                "Price Level": f"${r1:.2f}",
-                "Trigger":     f"Price at/above +{r1_pct}% (${r1:.2f})",
-                "Rationale":   "Reduce at Resistance 1 — lock in gains",
-                "Risk":        "Partial exit reduces downside exposure",
-            },
-            {
-                "Tranche":     "Trim 40%",
-                "Price Level": f"${r2:.2f}",
-                "Trigger":     f"Price at/above +{r2_pct}% (${r2:.2f})",
-                "Rationale":   "Further reduction at Resistance 2",
-                "Risk":        "Only 30% position remaining",
-            },
-            {
-                "Tranche":     "Full Exit 30%",
-                "Price Level": f"${stop_loss:.2f}",
-                "Trigger":     f"Stop loss hit (${stop_loss:.2f})",
-                "Rationale":   "Capital protection — exit remaining position",
-                "Risk":        "Maximum loss capped at stop level",
-            },
-        ]
+    # ── Weighted average cost (all 5 tranches equal weight) ────────────────
+    avg_cost_down = round(sum([d1, d2, d3, d4, d5]) / 5, 2)
+    avg_cost_up   = round(sum([u1, u2, u3, u4, u5]) / 5, 2)
 
-    return plan, stop_loss, s1, s2, r1, r2
+    # ── Downside plan rows ─────────────────────────────────────────────────
+    down_labels = [
+        "T1 · 20% — Initiate",
+        "T2 · 20% — Add",
+        "T3 · 20% — Add more",
+        "T4 · 20% — Heavy add",
+        "T5 · 20% — Max load",
+    ]
+    down_rationale = [
+        "First entry — undervalued signal confirmed",
+        f"Pullback to -{_pct_dn(d2):.1f}% — reduce avg cost",
+        f"Deeper support at -{_pct_dn(d3):.1f}% — scale in",
+        f"Strong support zone at -{_pct_dn(d4):.1f}% — largest add",
+        f"Max drawdown level at -{_pct_dn(d5):.1f}% — final tranche",
+    ]
+    down_prices  = [d1, d2, d3, d4, d5]
+
+    down_plan = []
+    for i, (lbl, price, rat) in enumerate(zip(down_labels, down_prices, down_rationale)):
+        pct_str = "—" if i == 0 else f"-{_pct_dn(price):.1f}%"
+        down_plan.append({
+            "Tranche":    lbl,
+            "Price":      f"${price:,.2f}",
+            "Δ From Now": pct_str,
+            "Rationale":  rat,
+        })
+    # Summary row
+    sl_pct = round((cp - stop_loss) / cp * 100, 1)
+    ac_pct = round((cp - avg_cost_down) / cp * 100, 1)
+    down_plan.append({
+        "Tranche":    "📊 SUMMARY",
+        "Price":      f"Avg Cost: ${avg_cost_down:,.2f}",
+        "Δ From Now": f"-{ac_pct:.1f}% avg",
+        "Rationale":  f"Stop Loss ${stop_loss:,.2f} (-{sl_pct:.1f}%) · Max drawdown ~{sl_pct:.0f}% on T1",
+    })
+
+    # ── Upside plan rows ───────────────────────────────────────────────────
+    up_labels = [
+        "T1 · Trim 20% — Quick profit",
+        "T2 · Trim 20% — R1 resistance",
+        "T3 · Trim 20% — Mid target",
+        "T4 · Trim 20% — Extended move",
+        "T5 · Exit 20% — Full target",
+    ]
+    up_rationale = [
+        f"+{_pct_up(u1):.1f}% — lock in first tranche, let rest run",
+        f"+{_pct_up(u2):.1f}% — first resistance cluster, book gains",
+        f"+{_pct_up(u3):.1f}% — mid-run exit, reduces position risk",
+        f"+{_pct_up(u4):.1f}% — extended move; only strong conviction holds",
+        f"+{_pct_up(u5):.1f}% — full target; close remaining position",
+    ]
+    up_prices = [u1, u2, u3, u4, u5]
+
+    up_plan = []
+    for lbl, price, rat in zip(up_labels, up_prices, up_rationale):
+        up_plan.append({
+            "Tranche":    lbl,
+            "Price":      f"${price:,.2f}",
+            "Δ From Now": f"+{_pct_up(price):.1f}%",
+            "Rationale":  rat,
+        })
+    # Summary row
+    avg_exit_pct = round((avg_cost_up - cp) / cp * 100, 1)
+    up_plan.append({
+        "Tranche":    "📊 SUMMARY",
+        "Price":      f"Avg Exit: ${avg_cost_up:,.2f}",
+        "Δ From Now": f"+{avg_exit_pct:.1f}% avg",
+        "Rationale":  f"Blended exit if all 5 targets hit · R:R vs stop = {round(avg_exit_pct/sl_pct,2):.2f}×",
+    })
+
+    levels = {
+        "d1": d1, "d2": d2, "d3": d3, "d4": d4, "d5": d5,
+        "u1": u1, "u2": u2, "u3": u3, "u4": u4, "u5": u5,
+        "avg_cost_down": avg_cost_down,
+        "avg_cost_up":   avg_cost_up,
+    }
+
+    return down_plan, up_plan, stop_loss, levels
 
 
 # ─────────────────────────────────────────────

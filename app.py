@@ -1361,40 +1361,71 @@ Signal thresholds: BUY ≥ 70 · ACCUMULATE 60–70 · HOLD 45–60 · REDUCE 35
 
     if current_price and hist_df is not None and not hist_df.empty:
         resistance, support = find_support_resistance(hist_df)
-        plan, stop_loss, s1, s2, r1, r2 = tranche_plan(action, current_price, support, resistance)
+        down_plan, up_plan, stop_loss, lvls = tranche_plan(
+            action, current_price, support, resistance
+        )
+        d5 = lvls["d5"]    # deepest downside tranche (for risk metrics)
+        u1 = lvls["u1"]    # first upside target
 
-        st.markdown("### Tranche Deployment Plan")
+        # ── Stop loss banner ──────────────────────────────────────────────
+        sl_pct = round((stop_loss - current_price) / current_price * 100, 2)
+        st.markdown(f"""
+        <div style="background:#1e293b;border:1px solid #ef4444;border-radius:8px;
+                    padding:12px 16px;margin-bottom:16px">
+          <span style="color:#94a3b8;font-size:0.85rem">Hard Stop Loss: </span>
+          <span style="color:#ef4444;font-weight:700;font-size:1rem">${stop_loss:,.2f}</span>
+          <span style="color:#64748b;font-size:0.8rem;margin-left:8px">
+            ({sl_pct:.2f}% from current · 3% below T5 entry)
+          </span>
+          <span style="color:#64748b;font-size:0.8rem;margin-left:12px">
+            Max drawdown on T1 capital: ~{abs(sl_pct):.0f}%
+          </span>
+        </div>""", unsafe_allow_html=True)
+
+        # ── Downside table ────────────────────────────────────────────────
+        st.markdown("### 📉 Downside Tranche Plan — Buy into Weakness")
         st.markdown(
             '<div style="color:#94a3b8;font-size:0.82rem;margin-bottom:8px">'
-            'Capital is split into 3 tranches deployed at <b>progressively lower prices</b> — '
-            'each tranche is at least 5–8% apart. This spreads timing risk: if the stock drops '
-            'further you buy more at better prices, reducing your average cost.'
+            'Capital split into <b>5 equal tranches (20% each)</b> at progressively lower prices. '
+            'Spreads from current price to ~35% below — max drawdown capped at ~38% '
+            '(stop 3% under T5). Snap to chart supports where available.'
             '</div>',
             unsafe_allow_html=True
         )
-        if plan:
-            plan_df = pd.DataFrame(plan)
-            st.dataframe(plan_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No tranche plan available for the current signal.")
+        down_df = pd.DataFrame(down_plan)
+        st.dataframe(down_df, use_container_width=True, hide_index=True)
 
+        # ── Upside table ──────────────────────────────────────────────────
+        st.markdown("### 📈 Upside Tranche Plan — Scale Out into Strength")
+        st.markdown(
+            '<div style="color:#94a3b8;font-size:0.82rem;margin-bottom:8px">'
+            'Sell <b>20% of position at each target</b> — from +8% to +40% above entry. '
+            'Locks in gains progressively while keeping exposure to a larger move. '
+            'Snap to chart resistances where available.'
+            '</div>',
+            unsafe_allow_html=True
+        )
+        up_df = pd.DataFrame(up_plan)
+        st.dataframe(up_df, use_container_width=True, hide_index=True)
+
+        # ── Risk Metrics ──────────────────────────────────────────────────
         st.markdown("### Risk Metrics")
         r1c, r2c, r3c, r4c = st.columns(4)
 
-        downside_to_s2 = ((s2 - current_price) / current_price * 100) if current_price else None
+        downside_to_d5 = ((d5 - current_price) / current_price * 100) if current_price else None
         analyst_target = fund_data.get("analyst_target")
         upside_analyst = ((analyst_target - current_price) / current_price * 100) if analyst_target and current_price else None
         upside_dcf     = ((dcf - current_price) / current_price * 100) if dcf and current_price else None
         best_upside    = upside_analyst if upside_analyst is not None else upside_dcf
         rr_ratio       = (
-            round(best_upside / abs(downside_to_s2), 2)
-            if best_upside is not None and downside_to_s2 and downside_to_s2 != 0
+            round(best_upside / abs(downside_to_d5), 2)
+            if best_upside is not None and downside_to_d5 and downside_to_d5 != 0
             else None
         )
 
         with r1c:
-            ds = f"{downside_to_s2:.2f}%" if downside_to_s2 is not None else "N/A"
-            metric_card("Downside to S2", ds, f"Strong support at ${s2:.2f}")
+            ds = f"{downside_to_d5:.2f}%" if downside_to_d5 is not None else "N/A"
+            metric_card("Downside to T5", ds, f"Deepest entry at ${d5:,.2f}")
         with r2c:
             us = f"{upside_analyst:+.2f}%" if upside_analyst is not None else "N/A"
             metric_card("Upside to Analyst Target", us, fmt_currency(analyst_target))
@@ -1409,15 +1440,6 @@ Signal thresholds: BUY ≥ 70 · ACCUMULATE 60–70 · HOLD 45–60 · REDUCE 35
               <div class="metric-value" style="color:{rr_color}">{rr}</div>
               <div class="metric-sub">Target: 2x or above</div>
             </div>""", unsafe_allow_html=True)
-
-        st.markdown(f"""
-        <div style="background:#1e293b;border:1px solid #ef4444;border-radius:8px;padding:12px 16px;margin-top:8px">
-          <span style="color:#94a3b8;font-size:0.85rem">Suggested Stop Loss: </span>
-          <span style="color:#ef4444;font-weight:700;font-size:1rem">${stop_loss:.2f}</span>
-          <span style="color:#64748b;font-size:0.8rem;margin-left:8px">
-            ({((stop_loss - current_price)/current_price*100):.2f}% from current)
-          </span>
-        </div>""", unsafe_allow_html=True)
 
     st.markdown("### Risk Flags")
     flags = []
@@ -1634,8 +1656,9 @@ with tab4:
           "Fundamental Score × 60% + Technical Score × 40%. "
           "BUY above 70 · ACCUMULATE 60–70 · HOLD 45–60 · REDUCE 35–45 · SELL below 35.")
     gloss("Tranche Plan",
-          "Splits capital into 3 tranches deployed at progressively lower prices (for buys) or higher (for sells), "
-          "reducing timing risk. Entry points anchored to support levels; exit targets anchored to resistance or analyst targets.")
+          "Splits capital into 5 equal tranches (20% each). Downside table: entries from current price to ~35% below "
+          "(max drawdown ~38%, stop 3% under T5) — snaps to chart supports. Upside table: exits from +8% to +40% above "
+          "entry — snaps to chart resistances. Summary row shows blended avg cost / avg exit and R:R ratio.")
     gloss("Risk / Reward Ratio",
           "Potential upside (to analyst target or DCF fair value) divided by potential downside (to S2 support). "
           "Target: 2x or above — for every 1% you risk, you should aim for 2% upside.")
