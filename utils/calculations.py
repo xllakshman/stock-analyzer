@@ -343,43 +343,112 @@ def atr(df: pd.DataFrame, period=14) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def find_support_resistance(df: pd.DataFrame, window=5, n_levels=3):
-    """Find swing highs (resistance) and swing lows (support)."""
-    highs = df["High"].values
-    lows  = df["Low"].values
+def find_support_resistance(df: pd.DataFrame, window=15, n_levels=3):
+    """
+    Find STRONG support and resistance levels only.
 
-    resistance = []
-    support    = []
+    Approach:
+    1. Detect swing pivots with a large window (15 bars) — filters out minor noise
+    2. Cluster pivots within 3% of each other → take volume-weighted mean per cluster
+    3. Score each cluster by: number of touches + volume at touches
+    4. Enforce minimum 5% separation between final levels (no bunching)
+    5. Return top n_levels by score, well-spaced apart
 
-    for i in range(window, len(highs) - window):
-        if all(highs[i] >= highs[i - j] for j in range(1, window + 1)) and \
-           all(highs[i] >= highs[i + j] for j in range(1, window + 1)):
-            resistance.append(highs[i])
-        if all(lows[i] <= lows[i - j] for j in range(1, window + 1)) and \
-           all(lows[i] <= lows[i + j] for j in range(1, window + 1)):
-            support.append(lows[i])
+    Result: 2-3 levels that are structurally significant, not every minor wiggle.
+    """
+    if df is None or len(df) < window * 2 + 1:
+        return [], []
 
-    def cluster_levels(levels, ascending=False):
-        if not levels:
+    highs   = df["High"].values
+    lows    = df["Low"].values
+    volumes = df["Volume"].values if "Volume" in df.columns else np.ones(len(highs))
+    n       = len(highs)
+
+    raw_res = []   # (price, volume) at each swing high
+    raw_sup = []   # (price, volume) at each swing low
+
+    for i in range(window, n - window):
+        h = highs[i]
+        l = lows[i]
+        v = float(volumes[i])
+
+        # Swing high: highest point in window on both sides
+        if h == max(highs[i - window: i + window + 1]):
+            raw_res.append((float(h), v))
+
+        # Swing low: lowest point in window on both sides
+        if l == min(lows[i - window: i + window + 1]):
+            raw_sup.append((float(l), v))
+
+    def cluster_and_score(pivots, min_sep_pct=0.05, top_n=n_levels):
+        """
+        Cluster nearby pivots, score by touch count + volume, enforce separation.
+        """
+        if not pivots:
             return []
-        sorted_l = sorted(set(levels), reverse=True)
-        clusters = []
-        used = set()
-        for l in sorted_l:
-            if l in used:
-                continue
-            group = [x for x in sorted_l if l != 0 and abs(x - l) / abs(l) < 0.01]
-            if not group:
-                group = [l]
-            clusters.append(round(float(np.mean(group)), 2))
-            used.update(group)
-        result = clusters[:n_levels]
-        result.sort(reverse=not ascending)
-        return result
 
-    # Resistance: ascending (nearest = lowest above price first)
-    # Support:    descending (nearest = highest below price first)
-    return cluster_levels(resistance, ascending=True), cluster_levels(support, ascending=False)
+        prices = np.array([p for p, _ in pivots])
+        vols   = np.array([v for _, v in pivots])
+        used   = np.zeros(len(prices), dtype=bool)
+        clusters = []
+
+        # Sort by price descending for resistance, ascending for support
+        order = np.argsort(prices)[::-1]
+
+        for idx in order:
+            if used[idx]:
+                continue
+            p = prices[idx]
+            # Find all pivots within 3% of this price
+            close_mask = (np.abs(prices - p) / p) < 0.03
+            close_mask &= ~used
+            group_prices = prices[close_mask]
+            group_vols   = vols[close_mask]
+
+            if len(group_vols) == 0:
+                continue
+
+            # Volume-weighted mean price for the cluster
+            total_vol = group_vols.sum()
+            if total_vol > 0:
+                cluster_price = float(np.average(group_prices, weights=group_vols))
+            else:
+                cluster_price = float(group_prices.mean())
+
+            # Score = touches × log(avg volume) — rewards frequently-tested levels
+            touches = len(group_prices)
+            avg_vol = float(group_vols.mean()) if len(group_vols) else 1
+            score   = touches * np.log1p(avg_vol)
+
+            clusters.append((round(cluster_price, 2), score, touches))
+            used[close_mask] = True
+
+        if not clusters:
+            return []
+
+        # Sort by score descending (strongest first)
+        clusters.sort(key=lambda x: x[1], reverse=True)
+
+        # Enforce minimum 5% separation between returned levels
+        final = []
+        for price, score, touches in clusters:
+            too_close = any(abs(price - fp) / fp < min_sep_pct for fp in final)
+            if not too_close:
+                final.append(price)
+            if len(final) >= top_n:
+                break
+
+        return final
+
+    res_levels = cluster_and_score(raw_res)
+    sup_levels = cluster_and_score(raw_sup)
+
+    # Resistance: ascending (lowest above price first in charts)
+    res_levels.sort()
+    # Support: descending (highest below price first in charts)
+    sup_levels.sort(reverse=True)
+
+    return res_levels, sup_levels
 
 
 def technical_score(df: pd.DataFrame):
